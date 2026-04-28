@@ -1,6 +1,6 @@
-# hermes-context-notifier
+# Hermes Context Notifier
 
-`hermes-context-notifier` is a Hermes Agent plugin for messaging platforms. It watches a gateway conversation's context window and posts a short note when usage crosses a threshold.
+`hermes-context-notifier` is a [Hermes Agent](https://hermes-agent.nousresearch.com/) plugin for messaging platforms. It watches a gateway conversation's context window and posts a short note when usage crosses a threshold.
 
 It is built for non-CLI conversations where the usual terminal context display is not visible. Slack is the only supported platform today. The plugin name stays broader so it can grow to Telegram, Discord, WhatsApp, Signal, Matrix, and other Hermes gateway platforms later.
 
@@ -92,6 +92,10 @@ PY
 ## Runtime state
 
 The plugin writes dedupe state to `cache.json` next to the plugin. Git ignores the file. It stores session metadata and bucket state, not message bodies or raw platform payloads.
+
+## License
+
+MIT.
 
 ## Why it uses private Hermes attributes
 
