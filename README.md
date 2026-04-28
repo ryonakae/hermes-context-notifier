@@ -5,7 +5,7 @@
 It is built for non-CLI conversations where the usual terminal context display is not visible. Slack is the only supported platform today. The plugin name stays broader so it can grow to Telegram, Discord, WhatsApp, Signal, Matrix, and other Hermes gateway platforms later.
 
 ```text
-:warning: Context: 85% (230K/270K)
+⚠️ Context: 85% (230K/270K)
 ```
 
 It does not patch Hermes core. The plugin listens to gateway hooks, reads context usage from the active agent, and sends the note after the main platform reply has gone out.
@@ -26,16 +26,16 @@ Emoji ranges:
 
 | Usage bucket | Emoji |
 | --- | --- |
-| 50-65% | `:straight_ruler:` |
-| 70-85% | `:warning:` |
-| 90%+ | `:rotating_light:` |
+| 50-65% | 📏 `:straight_ruler:` |
+| 70-85% | ⚠️ `:warning:` |
+| 90%+ | 🚨 `:rotating_light:` |
 
 Examples:
 
 ```text
-:straight_ruler: Context: 50% (135K/270K)
-:warning: Context: 85% (230K/270K)
-:rotating_light: Context: 90% (243K/270K)
+📏 Context: 50% (135K/270K)
+⚠️ Context: 85% (230K/270K)
+🚨 Context: 90% (243K/270K)
 ```
 
 ## Install
