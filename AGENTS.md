@@ -1,6 +1,6 @@
 # AGENTS.md
 
-`hermes-context-notifier` is a standalone Hermes Agent plugin that posts short Slack side-messages when a conversation crosses context-window usage buckets.
+`hermes-context-notifier` is a standalone Hermes Agent plugin for non-CLI gateway conversations. It posts short context-usage side-messages; current runtime support is Slack only, with room to add other Hermes messaging platforms later.
 
 ## Start here
 
@@ -56,13 +56,14 @@ Manual Slack validation requires a Hermes gateway restart after enabling or chan
 
 ## Runtime behavior
 
-- `pre_gateway_dispatch` captures Slack event metadata, gateway, adapter, session key, session id, chat id, thread id, and the gateway event loop.
+- `pre_gateway_dispatch` currently captures Slack event metadata, gateway, adapter, session key, session id, chat id, thread id, and the gateway event loop.
 - `post_llm_call` reads context usage from the live or cached agent: `agent.context_compressor.last_prompt_tokens / context_length`.
 - If usage cannot be read, skip the turn. Do not estimate from cumulative token counters.
 - Notifications start at 50% and fire once per 5% bucket per `session_key`.
 - If usage jumps across multiple buckets, send only the current bucket notification.
 - If usage drops after compression/reset, lower `last_notified_bucket` without sending a drop notification.
-- Send after the main Slack reply by chaining `register_post_delivery_callback`. Existing callbacks must run first.
+- Send after the main messaging-platform reply by chaining `register_post_delivery_callback`. Existing callbacks must run first.
+- Do not make CLI emit these notifications; CLI already has its own context/status surfaces.
 
 ## Important paths
 
@@ -89,7 +90,7 @@ plugins:
 
 ## Workflow notes
 
-- Keep Slack notifications short, for example `:warning: Context: 85% (230K/270K)`.
-- The notification target is always the current Slack conversation: thread, DM, or channel conversation.
-- Do not store message bodies, secrets, or raw Slack payloads in `cache.json`.
+- Keep messaging notifications short, for example `:warning: Context: 85% (230K/270K)`.
+- The notification target is the current gateway conversation. For Slack, that means the current thread, DM, or channel conversation.
+- Do not store message bodies, secrets, or raw platform payloads in `cache.json`.
 - Restart the gateway before expecting Slack or other gateway surfaces to use new plugin code.

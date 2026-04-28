@@ -1,23 +1,26 @@
 # hermes-context-notifier
 
-`hermes-context-notifier` is a standalone Hermes Agent plugin that posts a short Slack notice when the current conversation crosses context-window usage thresholds.
+`hermes-context-notifier` is a Hermes Agent plugin for messaging platforms. It watches a gateway conversation's context window and posts a short note when usage crosses a threshold.
+
+It is built for non-CLI conversations where the usual terminal context display is not visible. Slack is the only supported platform today. The plugin name stays broader so it can grow to Telegram, Discord, WhatsApp, Signal, Matrix, and other Hermes gateway platforms later.
 
 ```text
 :warning: Context: 85% (230K/270K)
 ```
 
-The plugin leaves Hermes core untouched. It observes gateway hooks, reads context usage from the active agent when available, and sends a side-message after the main Slack reply has been delivered.
+It does not patch Hermes core. The plugin listens to gateway hooks, reads context usage from the active agent, and sends the note after the main platform reply has gone out.
 
-## Behavior
+## What it does
 
-- Slack only for now.
-- Uses `agent.context_compressor.last_prompt_tokens / context_length` as the usage source.
-- Skips the turn if exact usage cannot be read.
-- Starts notifying at 50%.
-- Notifies once per 5% bucket per `session_key`.
-- Sends only the current bucket if usage jumps across multiple buckets.
-- Lowers the dedupe bucket after compression/reset so later growth can notify again.
-- Sends after the main gateway reply by chaining `register_post_delivery_callback`.
+- Supports Slack gateway conversations today. CLI is intentionally out of scope.
+- Uses a platform-neutral shape where possible so more Hermes gateway platforms can be added later.
+- Reads usage from `agent.context_compressor.last_prompt_tokens / context_length`.
+- Skips a turn when exact usage is unavailable.
+- Starts at 50% and checks every 5% bucket.
+- Sends one note per bucket for each `session_key`.
+- If usage jumps from, say, 49% to 72%, it sends the 70% note only.
+- If compression drops usage, it lowers the stored bucket so later growth can notify again.
+- Chains `register_post_delivery_callback` so existing post-delivery work runs first.
 
 Emoji ranges:
 
@@ -37,7 +40,7 @@ Examples:
 
 ## Install
 
-Clone or place this repository under the Hermes plugins directory:
+Clone the plugin into your Hermes plugins directory:
 
 ```bash
 git clone https://github.com/ryonakae/hermes-context-notifier.git ~/.hermes/plugins/hermes-context-notifier
@@ -55,14 +58,14 @@ Restart the Hermes gateway after enabling or changing the plugin.
 
 ## Development
 
-Run tests from the repository root:
+Run the checks from the repository root:
 
 ```bash
 python -m pytest -q
 python -m py_compile __init__.py hermes_context_notifier.py tests/test_context_notifier.py
 ```
 
-Check plugin discovery from the Hermes Agent source tree:
+Check plugin discovery from the Hermes Agent checkout:
 
 ```bash
 cd ~/.hermes/hermes-agent
@@ -80,16 +83,18 @@ PY
 
 ## Files
 
-- `plugin.yaml`: Hermes plugin manifest.
+- `plugin.yaml`: plugin manifest.
 - `__init__.py`: thin plugin entrypoint.
 - `hermes_context_notifier.py`: hook handlers and notification logic.
-- `tests/test_context_notifier.py`: unit tests for formatting, bucket logic, cache, usage extraction, and callback chaining.
-- `AGENTS.md`: instructions for coding agents working in this repo.
+- `tests/test_context_notifier.py`: tests for formatting, bucket logic, cache writes, usage extraction, and callback chaining.
+- `AGENTS.md`: notes for coding agents working in this repo.
 
 ## Runtime state
 
-The plugin stores dedupe state in `cache.json` next to the plugin. The file is ignored by git. It stores session metadata and bucket state, not message bodies or raw Slack payloads.
+The plugin writes dedupe state to `cache.json` next to the plugin. Git ignores the file. It stores session metadata and bucket state, not message bodies or raw platform payloads.
 
-## Notes
+## Why it uses private Hermes attributes
 
-This plugin depends on Hermes gateway private attributes such as `_running_agents`, `_agent_cache`, `_active_sessions`, and `_post_delivery_callbacks` because current hook payloads do not expose exact context-window usage or post-delivery composition directly. If Hermes internals change, update this plugin instead of patching Hermes core.
+Hermes hooks do not currently expose exact context-window usage or post-delivery callback composition as public plugin APIs. This plugin reads private gateway attributes such as `_running_agents`, `_agent_cache`, `_active_sessions`, and `_post_delivery_callbacks` to avoid modifying Hermes core.
+
+If those internals change, update this plugin rather than carrying a Hermes core patch.
