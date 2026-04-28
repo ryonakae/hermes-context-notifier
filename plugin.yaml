@@ -1,0 +1,8 @@
+name: hermes-context-notifier
+version: 0.1.0
+description: Notify gateway conversations when Hermes context usage crosses configured thresholds.
+author: Ryo Nakae
+kind: standalone
+provides_hooks:
+  - pre_gateway_dispatch
+  - post_llm_call

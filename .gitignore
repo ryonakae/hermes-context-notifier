@@ -1,0 +1,5 @@
+cache.json
+cache.json.tmp
+__pycache__/
+.pytest_cache/
+*.py[cod]
