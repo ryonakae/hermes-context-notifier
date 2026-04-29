@@ -23,8 +23,14 @@ def is_slack_event(event: Any) -> bool:
     return _platform_value(getattr(source, "platform", None)) == "slack"
 
 
-def _k(tokens: int) -> int:
-    return int(round((int(tokens) or 0) / 1000))
+def compact_token_count(tokens: int) -> str:
+    tokens = int(tokens) or 0
+    if abs(tokens) >= 1_000_000:
+        value = tokens / 1_000_000
+        if value.is_integer():
+            return f"{int(value)}M"
+        return f"{value:.1f}M"
+    return f"{int(round(tokens / 1000))}K"
 
 
 def emoji_for_bucket(bucket: int) -> str:
@@ -35,8 +41,19 @@ def emoji_for_bucket(bucket: int) -> str:
     return ":rotating_light:"
 
 
-def format_notice(bucket: int, used: int, limit: int) -> str:
-    return f"{emoji_for_bucket(bucket)} Context: {int(bucket)}% ({_k(used)}K/{_k(limit)}K)"
+def display_model_name(model: str) -> str:
+    model = (model or "").strip()
+    if not model:
+        return ""
+    return model.rsplit("/", 1)[-1]
+
+
+def format_notice(bucket: int, used: int, limit: int, model: str = "") -> str:
+    text = f"{emoji_for_bucket(bucket)} Context: {int(bucket)}% ({compact_token_count(used)}/{compact_token_count(limit)})"
+    display_model = display_model_name(model)
+    if display_model:
+        text = f"{text}, {display_model}"
+    return text
 
 
 def load_cache(path: Path = CACHE_PATH) -> dict[str, Any]:
@@ -72,7 +89,7 @@ def _bucket_for(used: int, limit: int) -> tuple[int, float] | None:
     return bucket, percent
 
 
-def evaluate_notification(record: dict[str, Any], *, used: int, limit: int) -> dict[str, Any] | None:
+def evaluate_notification(record: dict[str, Any], *, used: int, limit: int, model: str = "") -> dict[str, Any] | None:
     bucket_data = _bucket_for(used, limit)
     if bucket_data is None:
         return None
@@ -94,7 +111,7 @@ def evaluate_notification(record: dict[str, Any], *, used: int, limit: int) -> d
     record["last_notified_bucket"] = bucket
     return {
         "bucket": bucket,
-        "text": format_notice(bucket, used, limit),
+        "text": format_notice(bucket, used, limit, model=model),
         "used": int(used),
         "limit": int(limit),
         "percent": round(percent, 1),
@@ -269,7 +286,7 @@ def post_llm_call(session_id: str, model: str = "", platform: str = "", **_: Any
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
     )
-    notice = evaluate_notification(record, used=used, limit=limit)
+    notice = evaluate_notification(record, used=used, limit=limit, model=model)
     write_cache(CACHE_PATH, cache)
     if notice is None:
         return None

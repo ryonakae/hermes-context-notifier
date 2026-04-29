@@ -5,7 +5,7 @@
 It is built for non-CLI conversations where the usual terminal context display is not visible. Slack is the only supported platform today. The plugin name stays broader so it can grow to Telegram, Discord, WhatsApp, Signal, Matrix, and other Hermes gateway platforms later.
 
 ```text
-⚠️ Context: 85% (230K/270K)
+⚠️ Context: 85% (230K/270K), gpt-5.5
 ```
 
 It does not patch Hermes core. The plugin listens to gateway hooks, reads context usage from the active agent, and sends the note after the main platform reply has gone out.
@@ -15,6 +15,8 @@ It does not patch Hermes core. The plugin listens to gateway hooks, reads contex
 - Supports Slack gateway conversations today. CLI is intentionally out of scope.
 - Uses a platform-neutral shape where possible so more Hermes gateway platforms can be added later.
 - Reads usage from `agent.context_compressor.last_prompt_tokens / context_length`.
+- Adds the active model name when Hermes exposes it to the hook. Provider/path prefixes are shortened to the last component.
+- Formats large context windows as `1M` instead of `1000K`.
 - Skips a turn when exact usage is unavailable.
 - Starts at 50% and checks every 5% bucket.
 - Sends one note per bucket for each `session_key`.
@@ -33,9 +35,10 @@ Emoji ranges:
 Examples:
 
 ```text
-📏 Context: 50% (135K/270K)
-⚠️ Context: 85% (230K/270K)
-🚨 Context: 90% (243K/270K)
+📏 Context: 50% (135K/270K), gpt-5.5
+⚠️ Context: 85% (230K/270K), gpt-5.5
+🚨 Context: 90% (243K/270K), gpt-5.5
+⚠️ Context: 85% (850K/1M), gpt-5.5
 ```
 
 ## Install
@@ -86,7 +89,7 @@ PY
 - `plugin.yaml`: plugin manifest.
 - `__init__.py`: thin plugin entrypoint.
 - `hermes_context_notifier.py`: hook handlers and notification logic.
-- `tests/test_context_notifier.py`: tests for formatting, bucket logic, cache writes, usage extraction, and callback chaining.
+- `tests/test_context_notifier.py`: tests for formatting, compact token counts, model-name shortening, bucket logic, cache writes, usage extraction, and callback chaining.
 - `AGENTS.md`: notes for coding agents working in this repo.
 
 ## Runtime state

@@ -25,22 +25,35 @@ class DummyAdapter:
             self._post_delivery_callbacks[session_key] = (generation, callback)
 
 
-def test_format_notice_uses_expected_emoji_and_k_values():
+def test_format_notice_uses_expected_emoji_k_values_and_model_suffix():
     assert hcn.format_notice(50, 135_000, 270_000) == ":straight_ruler: Context: 50% (135K/270K)"
     assert hcn.format_notice(65, 176_000, 270_000) == ":straight_ruler: Context: 65% (176K/270K)"
     assert hcn.format_notice(70, 189_000, 270_000) == ":warning: Context: 70% (189K/270K)"
-    assert hcn.format_notice(85, 230_000, 270_000) == ":warning: Context: 85% (230K/270K)"
+    assert hcn.format_notice(85, 230_000, 270_000, model="gpt-5.5") == ":warning: Context: 85% (230K/270K), gpt-5.5"
     assert hcn.format_notice(90, 243_000, 270_000) == ":rotating_light: Context: 90% (243K/270K)"
+
+
+def test_display_model_name_uses_last_path_component():
+    assert hcn.display_model_name("openai-codex/gpt-5.5") == "gpt-5.5"
+    assert hcn.display_model_name("anthropic/claude-sonnet-4") == "claude-sonnet-4"
+    assert hcn.display_model_name("") == ""
+
+
+def test_compact_token_count_uses_millions_for_large_context_windows():
+    assert hcn.compact_token_count(270_000) == "270K"
+    assert hcn.compact_token_count(1_000_000) == "1M"
+    assert hcn.compact_token_count(1_250_000) == "1.2M"
+    assert hcn.format_notice(85, 850_000, 1_000_000, model="gpt-5.5") == ":warning: Context: 85% (850K/1M), gpt-5.5"
 
 
 def test_evaluate_notification_dedupes_and_handles_bucket_jumps():
     record = {}
 
-    notice = hcn.evaluate_notification(record, used=194_400, limit=270_000)
+    notice = hcn.evaluate_notification(record, used=194_400, limit=270_000, model="openai-codex/gpt-5.5")
 
     assert notice == {
         "bucket": 70,
-        "text": ":warning: Context: 70% (194K/270K)",
+        "text": ":warning: Context: 70% (194K/270K), gpt-5.5",
         "used": 194_400,
         "limit": 270_000,
         "percent": 72.0,
