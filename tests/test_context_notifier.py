@@ -25,6 +25,33 @@ class DummyAdapter:
             self._post_delivery_callbacks[session_key] = (generation, callback)
 
 
+def test_supported_platform_allowlist_matches_planned_scope():
+    assert hcn.DEFAULT_SUPPORTED_PLATFORMS == {
+        "slack",
+        "telegram",
+        "discord",
+        "mattermost",
+        "matrix",
+        "whatsapp",
+        "signal",
+        "feishu",
+        "dingtalk",
+        "bluebubbles",
+    }
+    assert not {
+        "email",
+        "sms",
+        "wecom",
+        "wecom_callback",
+        "weixin",
+        "qqbot",
+        "yuanbao",
+        "api_server",
+        "webhook",
+        "homeassistant",
+    } & hcn.DEFAULT_SUPPORTED_PLATFORMS
+
+
 def test_format_notice_uses_expected_emoji_k_values_and_model_suffix():
     assert hcn.format_notice(50, 135_000, 270_000) == ":straight_ruler: Context: 50% (135K/270K)"
     assert hcn.format_notice(65, 176_000, 270_000) == ":straight_ruler: Context: 65% (176K/270K)"
@@ -154,6 +181,25 @@ def test_capture_gateway_context_supports_telegram_and_keeps_thread_metadata():
     assert meta["chat_id"] == "chat-1"
     assert meta["thread_id"] == "topic-42"
     assert meta["metadata"] == {"message_thread_id": "topic-42"}
+
+
+def test_capture_gateway_context_falls_back_when_adapter_key_is_unhashable():
+    adapter = DummyAdapter()
+    source = SimpleNamespace(
+        platform=SimpleNamespace(value="discord"),
+        chat_id="thread-channel-1",
+        thread_id=None,
+    )
+    event = SimpleNamespace(source=source, message_id="msg-1")
+    entry = SimpleNamespace(session_key="key", session_id="sid")
+    session_store = SimpleNamespace(get_or_create_session=lambda src: entry)
+    gateway = SimpleNamespace(adapters={"discord": adapter})
+
+    meta = hcn.capture_gateway_context(event=event, gateway=gateway, session_store=session_store)
+
+    assert meta["platform"] == "discord"
+    assert meta["adapter"] is adapter
+    assert meta["chat_id"] == "thread-channel-1"
 
 
 def test_capture_gateway_context_ignores_unsupported_platform():

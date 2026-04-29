@@ -131,7 +131,7 @@ def test_capture_gateway_context_supports_telegram_and_keeps_thread_metadata():
     event = SimpleNamespace(source=source, message_id="msg-1", metadata={"message_thread_id": "topic-42"})
     entry = SimpleNamespace(session_key="key", session_id="sid")
     session_store = SimpleNamespace(get_or_create_session=lambda src: entry)
-    gateway = SimpleNamespace(adapters={source.platform: adapter})
+    gateway = SimpleNamespace(adapters={"telegram": adapter})
 
     meta = hcn.capture_gateway_context(event=event, gateway=gateway, session_store=session_store)
 
