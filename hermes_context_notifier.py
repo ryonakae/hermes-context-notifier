@@ -11,6 +11,19 @@ from typing import Any, Callable
 PLUGIN_DIR = Path(__file__).resolve().parent
 CACHE_PATH = PLUGIN_DIR / "cache.json"
 
+DEFAULT_SUPPORTED_PLATFORMS = {
+    "slack",
+    "telegram",
+    "discord",
+    "mattermost",
+    "matrix",
+    "whatsapp",
+    "signal",
+    "feishu",
+    "dingtalk",
+    "bluebubbles",
+}
+
 _SESSION_CONTEXT_BY_ID: dict[str, dict[str, Any]] = {}
 
 
@@ -21,6 +34,11 @@ def _platform_value(platform: Any) -> str:
 def is_slack_event(event: Any) -> bool:
     source = getattr(event, "source", None)
     return _platform_value(getattr(source, "platform", None)) == "slack"
+
+
+def is_supported_event(event: Any) -> bool:
+    source = getattr(event, "source", None)
+    return _platform_value(getattr(source, "platform", None)) in DEFAULT_SUPPORTED_PLATFORMS
 
 
 def compact_token_count(tokens: int) -> str:
@@ -145,8 +163,44 @@ def extract_usage(gateway: Any, session_key: str) -> tuple[int, int, Any] | None
     return _agent_usage(agent) if agent is not None else None
 
 
+def _adapter_for_platform(gateway: Any, platform_key: Any, platform: str) -> Any:
+    adapters = getattr(gateway, "adapters", {}) or {}
+    try:
+        adapter = adapters.get(platform_key)
+    except TypeError:
+        adapter = None
+    if adapter is not None:
+        return adapter
+    for key, candidate in adapters.items():
+        if _platform_value(key) == platform:
+            return candidate
+    return None
+
+
+def _event_metadata(event: Any) -> dict[str, Any]:
+    metadata = getattr(event, "metadata", None)
+    return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _thread_id_for_event(event: Any, platform: str) -> str | None:
+    source = getattr(event, "source", None)
+    thread_id = getattr(source, "thread_id", None)
+    if thread_id:
+        return str(thread_id)
+
+    metadata = _event_metadata(event)
+    for key in ("thread_id", "thread_ts", "message_thread_id", "root_id"):
+        value = metadata.get(key)
+        if value:
+            return str(value)
+
+    if platform == "slack":
+        return getattr(event, "message_id", None)
+    return None
+
+
 def capture_gateway_context(event: Any, gateway: Any, session_store: Any, **_: Any) -> dict[str, Any] | None:
-    if not is_slack_event(event):
+    if not is_supported_event(event):
         return None
 
     entry = session_store.get_or_create_session(event.source)
@@ -161,29 +215,20 @@ def capture_gateway_context(event: Any, gateway: Any, session_store: Any, **_: A
         loop = None
 
     source = event.source
-    adapters = getattr(gateway, "adapters", {}) or {}
-    adapter = None
     platform_key = getattr(source, "platform", None)
-    try:
-        adapter = adapters.get(platform_key)
-    except TypeError:
-        adapter = None
-    if adapter is None:
-        for key, candidate in adapters.items():
-            if _platform_value(key) == "slack":
-                adapter = candidate
-                break
-
-    thread_id = getattr(source, "thread_id", None) or getattr(event, "message_id", None)
+    platform = _platform_value(platform_key)
+    adapter = _adapter_for_platform(gateway, platform_key, platform)
+    thread_id = _thread_id_for_event(event, platform)
     meta = {
         "gateway": gateway,
         "adapter": adapter,
         "session_store": session_store,
         "session_key": session_key,
         "session_id": session_id,
-        "platform": "slack",
+        "platform": platform,
         "chat_id": getattr(source, "chat_id", None),
         "thread_id": thread_id,
+        "metadata": _event_metadata(event),
         "loop": loop,
     }
     _SESSION_CONTEXT_BY_ID[session_id] = meta
@@ -197,8 +242,24 @@ def _unwrap_callback(entry: Any) -> tuple[int | None, Callable | None]:
     return None, entry if callable(entry) else None
 
 
-def _send_later(adapter: Any, chat_id: str, text: str, thread_id: str | None, loop: asyncio.AbstractEventLoop | None) -> None:
-    metadata = {"thread_id": thread_id} if thread_id else None
+def notice_send_metadata(meta: dict[str, Any]) -> dict[str, Any] | None:
+    original = meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {}
+    metadata: dict[str, Any] = {}
+
+    thread_id = meta.get("thread_id")
+    if thread_id:
+        metadata["thread_id"] = thread_id
+
+    for key in ("message_thread_id", "thread_ts", "root_id"):
+        value = original.get(key)
+        if value:
+            metadata[key] = value
+
+    return metadata or None
+
+
+def _send_later(adapter: Any, chat_id: str, text: str, meta: dict[str, Any], loop: asyncio.AbstractEventLoop | None) -> None:
+    metadata = notice_send_metadata(meta)
 
     async def _send() -> None:
         await adapter.send(chat_id, text, metadata=metadata)
@@ -216,8 +277,8 @@ def register_post_delivery_notice(
     adapter: Any,
     session_key: str,
     chat_id: str,
-    thread_id: str | None,
     text: str,
+    meta: dict[str, Any],
     loop: asyncio.AbstractEventLoop | None,
     generation: int | None = None,
 ) -> None:
@@ -228,7 +289,7 @@ def register_post_delivery_notice(
     def combined_callback() -> None:
         if callable(existing_callback):
             existing_callback()
-        _send_later(adapter, chat_id, text, thread_id, loop)
+        _send_later(adapter, chat_id, text, meta, loop)
 
     if hasattr(adapter, "register_post_delivery_callback"):
         adapter.register_post_delivery_callback(
@@ -279,7 +340,7 @@ def post_llm_call(session_id: str, model: str = "", platform: str = "", **_: Any
     record.update(
         {
             "session_id": session_id,
-            "platform": "slack",
+            "platform": meta.get("platform") or platform or "",
             "chat_id": chat_id,
             "thread_id": meta.get("thread_id"),
             "model": model,
@@ -294,10 +355,7 @@ def post_llm_call(session_id: str, model: str = "", platform: str = "", **_: Any
     adapter = meta.get("adapter")
     if adapter is None:
         # Fallback for adapter maps keyed differently from event.source.platform.
-        for key, candidate in (getattr(gateway, "adapters", {}) or {}).items():
-            if _platform_value(key) == "slack":
-                adapter = candidate
-                break
+        adapter = _adapter_for_platform(gateway, None, meta.get("platform") or platform or "")
     if adapter is None:
         return None
 
@@ -305,8 +363,8 @@ def post_llm_call(session_id: str, model: str = "", platform: str = "", **_: Any
         adapter=adapter,
         session_key=session_key,
         chat_id=chat_id,
-        thread_id=meta.get("thread_id"),
         text=notice["text"],
+        meta=meta,
         loop=meta.get("loop"),
         generation=_adapter_generation(adapter, session_key),
     )

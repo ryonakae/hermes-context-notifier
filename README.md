@@ -2,7 +2,7 @@
 
 `hermes-context-notifier` is a [Hermes Agent](https://hermes-agent.nousresearch.com/) plugin for messaging platforms. It watches a gateway conversation's context window and posts a short note when usage crosses a threshold.
 
-It is built for non-CLI conversations where the usual terminal context display is not visible. Slack is the only supported platform today. The plugin name stays broader so it can grow to Telegram, Discord, WhatsApp, Signal, Matrix, and other Hermes gateway platforms later.
+It is built for non-CLI conversations where the usual terminal context display is not visible. It supports Slack, Telegram, Discord, Mattermost, Matrix, WhatsApp, Signal, Feishu, DingTalk, and BlueBubbles/iMessage gateway conversations.
 
 ```text
 ⚠️ Context: 85% (230K/270K), gpt-5.5
@@ -12,8 +12,8 @@ It does not patch Hermes core. The plugin listens to gateway hooks, reads contex
 
 ## What it does
 
-- Supports Slack gateway conversations today. CLI is intentionally out of scope.
-- Uses a platform-neutral shape where possible so more Hermes gateway platforms can be added later.
+- Supports selected messaging gateway conversations. CLI is intentionally out of scope.
+- Uses a platform-neutral capture/send path, with an allowlist for platforms where a short side-message fits the UX.
 - Reads usage from `agent.context_compressor.last_prompt_tokens / context_length`.
 - Adds the active model name when Hermes exposes it to the hook. Provider/path prefixes are shortened to the last component.
 - Formats large context windows as `1M` instead of `1000K`.
@@ -23,6 +23,25 @@ It does not patch Hermes core. The plugin listens to gateway hooks, reads contex
 - If usage jumps from, say, 49% to 72%, it sends the 70% note only.
 - If compression drops usage, it lowers the stored bucket so later growth can notify again.
 - Chains `register_post_delivery_callback` so existing post-delivery work runs first.
+
+Supported by default:
+
+- Slack
+- Telegram
+- Discord
+- Mattermost
+- Matrix
+- WhatsApp
+- Signal
+- Feishu
+- DingTalk
+- BlueBubbles / iMessage
+
+Out of scope for this plugin for now:
+
+- Email and SMS, because context notices would create extra emails/texts.
+- Webhook, API Server, and Home Assistant, because they are integration surfaces rather than normal chat UI.
+- WeCom, WeCom Callback, Weixin, QQBot, and Yuanbao because they need platform-specific validation.
 
 Emoji ranges:
 
@@ -89,7 +108,7 @@ PY
 - `plugin.yaml`: plugin manifest.
 - `__init__.py`: thin plugin entrypoint.
 - `hermes_context_notifier.py`: hook handlers and notification logic.
-- `tests/test_context_notifier.py`: tests for formatting, compact token counts, model-name shortening, bucket logic, cache writes, usage extraction, and callback chaining.
+- `tests/test_context_notifier.py`: tests for formatting, compact token counts, model-name shortening, bucket logic, cache writes, usage extraction, platform capture, metadata preservation, and callback chaining.
 - `AGENTS.md`: notes for coding agents working in this repo.
 
 ## Runtime state

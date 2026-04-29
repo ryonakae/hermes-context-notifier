@@ -129,18 +129,74 @@ def test_capture_slack_session_context_uses_session_key_and_thread_fallback():
 
     assert meta["session_key"] == "key"
     assert meta["session_id"] == "sid"
+    assert meta["platform"] == "slack"
     assert meta["chat_id"] == "C1"
     assert meta["thread_id"] == "177.1"
     assert hcn._SESSION_CONTEXT_BY_ID["sid"] is meta
 
 
-def test_capture_gateway_context_ignores_non_slack():
-    source = SimpleNamespace(platform=SimpleNamespace(value="telegram"), chat_id="C1", thread_id=None)
+def test_capture_gateway_context_supports_telegram_and_keeps_thread_metadata():
+    adapter = DummyAdapter()
+    source = SimpleNamespace(
+        platform=SimpleNamespace(value="telegram"),
+        chat_id="chat-1",
+        thread_id="topic-42",
+    )
+    event = SimpleNamespace(source=source, message_id="msg-1", metadata={"message_thread_id": "topic-42"})
+    entry = SimpleNamespace(session_key="key", session_id="sid")
+    session_store = SimpleNamespace(get_or_create_session=lambda src: entry)
+    gateway = SimpleNamespace(adapters={"telegram": adapter})
+
+    meta = hcn.capture_gateway_context(event=event, gateway=gateway, session_store=session_store)
+
+    assert meta["platform"] == "telegram"
+    assert meta["adapter"] is adapter
+    assert meta["chat_id"] == "chat-1"
+    assert meta["thread_id"] == "topic-42"
+    assert meta["metadata"] == {"message_thread_id": "topic-42"}
+
+
+def test_capture_gateway_context_ignores_unsupported_platform():
+    source = SimpleNamespace(platform=SimpleNamespace(value="email"), chat_id="C1", thread_id=None)
     event = SimpleNamespace(source=source, message_id="m1")
     session_store = SimpleNamespace(get_or_create_session=lambda src: pytest.fail("should not create session"))
 
     assert hcn.capture_gateway_context(event=event, gateway=SimpleNamespace(), session_store=session_store) is None
 
+
+def test_notice_send_metadata_preserves_thread_context():
+    assert hcn.notice_send_metadata({"platform": "slack", "thread_id": "177.1", "metadata": {}}) == {"thread_id": "177.1"}
+    assert hcn.notice_send_metadata({"platform": "telegram", "thread_id": "42", "metadata": {"message_thread_id": "42"}}) == {"thread_id": "42", "message_thread_id": "42"}
+    assert hcn.notice_send_metadata({"platform": "signal", "thread_id": None, "metadata": {}}) is None
+
+
+def test_post_llm_call_records_non_slack_platform_and_registers_notice(tmp_path, monkeypatch):
+    cache_path = tmp_path / "cache.json"
+    monkeypatch.setattr(hcn, "CACHE_PATH", cache_path)
+    adapter = DummyAdapter()
+    compressor = SimpleNamespace(last_prompt_tokens=194_400, context_length=270_000)
+    agent = SimpleNamespace(context_compressor=compressor)
+    gateway = SimpleNamespace(_running_agents={"session": agent}, _agent_cache={}, adapters={"telegram": adapter})
+    hcn._SESSION_CONTEXT_BY_ID["sid"] = {
+        "gateway": gateway,
+        "adapter": adapter,
+        "session_key": "session",
+        "session_id": "sid",
+        "platform": "telegram",
+        "chat_id": "chat-1",
+        "thread_id": "42",
+        "metadata": {"message_thread_id": "42"},
+        "loop": None,
+    }
+
+    hcn.post_llm_call(session_id="sid", model="openai-codex/gpt-5.5", platform="telegram")
+
+    data = json.loads(cache_path.read_text())
+    record = data["sessions"]["session"]
+    assert record["platform"] == "telegram"
+    assert record["thread_id"] == "42"
+    assert record["model"] == "openai-codex/gpt-5.5"
+    assert "session" in adapter._post_delivery_callbacks
 
 def test_register_post_delivery_notice_chains_existing_callback_and_sends_after_it():
     adapter = DummyAdapter()
@@ -154,7 +210,7 @@ def test_register_post_delivery_notice_chains_existing_callback_and_sends_after_
             adapter=adapter,
             session_key="session",
             chat_id="C1",
-            thread_id="T1",
+            meta={"platform": "slack", "thread_id": "T1", "metadata": {}},
             text=":warning: Context: 85% (230K/270K)",
             loop=loop,
             generation=None,
@@ -179,7 +235,7 @@ def test_register_post_delivery_notice_preserves_existing_generation_tuple():
             adapter=adapter,
             session_key="session",
             chat_id="C1",
-            thread_id=None,
+            meta={"platform": "slack", "thread_id": None, "metadata": {}},
             text=":warning: Context: 85% (230K/270K)",
             loop=loop,
             generation=7,
