@@ -57,7 +57,7 @@ def test_format_notice_uses_expected_emoji_k_values_model_suffix_and_reasoning_e
     assert hcn.format_notice(65, 176_000, 270_000) == ":straight_ruler: Context: 65% (176K/270K)"
     assert hcn.format_notice(70, 189_000, 270_000) == ":warning: Context: 70% (189K/270K)"
     assert hcn.format_notice(85, 230_000, 270_000, model="gpt-5.5") == ":warning: Context: 85% (230K/270K), gpt-5.5"
-    assert hcn.format_notice(85, 230_000, 270_000, model="gpt-5.5", effort="medium") == ":warning: Context: 85% (230K/270K), gpt-5.5 (medium)"
+    assert hcn.format_notice(85, 230_000, 270_000, model="gpt-5.5", effort="medium") == ":warning: Context: 85% (230K/270K), gpt-5.5 medium"
     assert hcn.format_notice(90, 243_000, 270_000) == ":rotating_light: Context: 90% (243K/270K)"
 
 
@@ -94,7 +94,7 @@ def test_evaluate_notification_dedupes_and_handles_bucket_jumps():
 
     assert notice == {
         "bucket": 70,
-        "text": ":warning: Context: 70% (194K/270K), gpt-5.5 (medium)",
+        "text": ":warning: Context: 70% (194K/270K), gpt-5.5 medium",
         "used": 194_400,
         "limit": 270_000,
         "percent": 72.0,

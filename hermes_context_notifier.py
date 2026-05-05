@@ -80,7 +80,7 @@ def format_notice(bucket: int, used: int, limit: int, model: str = "", effort: s
     display_model = display_model_name(model)
     display_effort = (effort or "").strip().lower()
     if display_model and display_effort:
-        text = f"{text}, {display_model} ({display_effort})"
+        text = f"{text}, {display_model} {display_effort}"
     elif display_model:
         text = f"{text}, {display_model}"
     elif display_effort:

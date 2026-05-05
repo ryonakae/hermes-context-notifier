@@ -5,7 +5,7 @@
 It is built for non-CLI conversations where the usual terminal context display is not visible. It supports Slack, Telegram, Discord, Mattermost, Matrix, WhatsApp, Signal, Feishu, DingTalk, and BlueBubbles/iMessage gateway conversations.
 
 ```text
-⚠️ Context: 85% (230K/270K), gpt-5.5 (medium)
+⚠️ Context: 85% (230K/270K), gpt-5.5 medium
 ```
 
 It does not patch Hermes core. The plugin listens to gateway hooks, reads context usage from the active agent, and sends the note after the main platform reply has gone out.
@@ -16,7 +16,7 @@ It does not patch Hermes core. The plugin listens to gateway hooks, reads contex
 - Uses a platform-neutral capture/send path, with an allowlist for platforms where a short side-message fits the UX.
 - Reads usage from `agent.context_compressor.last_prompt_tokens / context_length`.
 - Adds the active model name when Hermes exposes it to the hook. Provider/path prefixes are shortened to the last component.
-- Adds the reasoning effort after the model name when it is available from the active agent, for example `gpt-5.5 (medium)`.
+- Adds the reasoning effort after the model name when it is available from the active agent, for example `gpt-5.5 medium`.
 - Formats large context windows as `1M` instead of `1000K`.
 - Skips a turn when exact usage is unavailable.
 - Starts at 50% and checks every 5% bucket.
@@ -55,10 +55,10 @@ Emoji ranges:
 Examples:
 
 ```text
-📏 Context: 50% (135K/270K), gpt-5.5 (medium)
-⚠️ Context: 85% (230K/270K), gpt-5.5 (medium)
-🚨 Context: 90% (243K/270K), gpt-5.5 (medium)
-⚠️ Context: 85% (850K/1M), gpt-5.5 (medium)
+📏 Context: 50% (135K/270K), gpt-5.5 medium
+⚠️ Context: 85% (230K/270K), gpt-5.5 medium
+🚨 Context: 90% (243K/270K), gpt-5.5 medium
+⚠️ Context: 85% (850K/1M), gpt-5.5 medium
 ```
 
 ## Install

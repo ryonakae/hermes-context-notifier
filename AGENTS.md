@@ -93,7 +93,7 @@ plugins:
 
 ## Workflow notes
 
-- Keep messaging notifications short, for example `:warning: Context: 85% (230K/270K), gpt-5.5 (medium)`; for million-token windows use `1M`, not `1000K`.
+- Keep messaging notifications short, for example `:warning: Context: 85% (230K/270K), gpt-5.5 medium`; for million-token windows use `1M`, not `1000K`.
 - The notification target is the current gateway conversation. Preserve platform thread/topic metadata via `notice_send_metadata()`.
 - Do not store message bodies, secrets, or raw platform payloads in `cache.json`.
 - Restart the gateway before expecting Slack or other gateway surfaces to use new plugin code.
