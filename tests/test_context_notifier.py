@@ -52,11 +52,12 @@ def test_supported_platform_allowlist_matches_planned_scope():
     } & hcn.DEFAULT_SUPPORTED_PLATFORMS
 
 
-def test_format_notice_uses_expected_emoji_k_values_and_model_suffix():
+def test_format_notice_uses_expected_emoji_k_values_model_suffix_and_reasoning_effort():
     assert hcn.format_notice(50, 135_000, 270_000) == ":straight_ruler: Context: 50% (135K/270K)"
     assert hcn.format_notice(65, 176_000, 270_000) == ":straight_ruler: Context: 65% (176K/270K)"
     assert hcn.format_notice(70, 189_000, 270_000) == ":warning: Context: 70% (189K/270K)"
     assert hcn.format_notice(85, 230_000, 270_000, model="gpt-5.5") == ":warning: Context: 85% (230K/270K), gpt-5.5"
+    assert hcn.format_notice(85, 230_000, 270_000, model="gpt-5.5", effort="medium") == ":warning: Context: 85% (230K/270K), gpt-5.5 (medium)"
     assert hcn.format_notice(90, 243_000, 270_000) == ":rotating_light: Context: 90% (243K/270K)"
 
 
@@ -64,6 +65,13 @@ def test_display_model_name_uses_last_path_component():
     assert hcn.display_model_name("openai-codex/gpt-5.5") == "gpt-5.5"
     assert hcn.display_model_name("anthropic/claude-sonnet-4") == "claude-sonnet-4"
     assert hcn.display_model_name("") == ""
+
+
+def test_display_reasoning_effort_reads_config_dict_and_none_state():
+    assert hcn.display_reasoning_effort({"enabled": True, "effort": "medium"}) == "medium"
+    assert hcn.display_reasoning_effort({"enabled": False}) == "none"
+    assert hcn.display_reasoning_effort({"effort": ""}) == ""
+    assert hcn.display_reasoning_effort(None) == ""
 
 
 def test_compact_token_count_uses_millions_for_large_context_windows():
@@ -76,11 +84,17 @@ def test_compact_token_count_uses_millions_for_large_context_windows():
 def test_evaluate_notification_dedupes_and_handles_bucket_jumps():
     record = {}
 
-    notice = hcn.evaluate_notification(record, used=194_400, limit=270_000, model="openai-codex/gpt-5.5")
+    notice = hcn.evaluate_notification(
+        record,
+        used=194_400,
+        limit=270_000,
+        model="openai-codex/gpt-5.5",
+        effort="medium",
+    )
 
     assert notice == {
         "bucket": 70,
-        "text": ":warning: Context: 70% (194K/270K), gpt-5.5",
+        "text": ":warning: Context: 70% (194K/270K), gpt-5.5 (medium)",
         "used": 194_400,
         "limit": 270_000,
         "percent": 72.0,
@@ -221,7 +235,7 @@ def test_post_llm_call_records_non_slack_platform_and_registers_notice(tmp_path,
     monkeypatch.setattr(hcn, "CACHE_PATH", cache_path)
     adapter = DummyAdapter()
     compressor = SimpleNamespace(last_prompt_tokens=194_400, context_length=270_000)
-    agent = SimpleNamespace(context_compressor=compressor)
+    agent = SimpleNamespace(context_compressor=compressor, reasoning_config={"enabled": True, "effort": "medium"})
     gateway = SimpleNamespace(_running_agents={"session": agent}, _agent_cache={}, adapters={"telegram": adapter})
     hcn._SESSION_CONTEXT_BY_ID["sid"] = {
         "gateway": gateway,
@@ -242,6 +256,7 @@ def test_post_llm_call_records_non_slack_platform_and_registers_notice(tmp_path,
     assert record["platform"] == "telegram"
     assert record["thread_id"] == "42"
     assert record["model"] == "openai-codex/gpt-5.5"
+    assert record["reasoning_effort"] == "medium"
     assert "session" in adapter._post_delivery_callbacks
 
 def test_register_post_delivery_notice_chains_existing_callback_and_sends_after_it():

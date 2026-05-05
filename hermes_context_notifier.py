@@ -66,11 +66,25 @@ def display_model_name(model: str) -> str:
     return model.rsplit("/", 1)[-1]
 
 
-def format_notice(bucket: int, used: int, limit: int, model: str = "") -> str:
+def display_reasoning_effort(reasoning_config: Any) -> str:
+    if not isinstance(reasoning_config, dict):
+        return ""
+    if reasoning_config.get("enabled") is False:
+        return "none"
+    effort = str(reasoning_config.get("effort", "") or "").strip().lower()
+    return effort
+
+
+def format_notice(bucket: int, used: int, limit: int, model: str = "", effort: str = "") -> str:
     text = f"{emoji_for_bucket(bucket)} Context: {int(bucket)}% ({compact_token_count(used)}/{compact_token_count(limit)})"
     display_model = display_model_name(model)
-    if display_model:
+    display_effort = (effort or "").strip().lower()
+    if display_model and display_effort:
+        text = f"{text}, {display_model} ({display_effort})"
+    elif display_model:
         text = f"{text}, {display_model}"
+    elif display_effort:
+        text = f"{text}, {display_effort}"
     return text
 
 
@@ -107,7 +121,14 @@ def _bucket_for(used: int, limit: int) -> tuple[int, float] | None:
     return bucket, percent
 
 
-def evaluate_notification(record: dict[str, Any], *, used: int, limit: int, model: str = "") -> dict[str, Any] | None:
+def evaluate_notification(
+    record: dict[str, Any],
+    *,
+    used: int,
+    limit: int,
+    model: str = "",
+    effort: str = "",
+) -> dict[str, Any] | None:
     bucket_data = _bucket_for(used, limit)
     if bucket_data is None:
         return None
@@ -129,7 +150,7 @@ def evaluate_notification(record: dict[str, Any], *, used: int, limit: int, mode
     record["last_notified_bucket"] = bucket
     return {
         "bucket": bucket,
-        "text": format_notice(bucket, used, limit, model=model),
+        "text": format_notice(bucket, used, limit, model=model, effort=effort),
         "used": int(used),
         "limit": int(limit),
         "percent": round(percent, 1),
@@ -161,6 +182,18 @@ def extract_usage(gateway: Any, session_key: str) -> tuple[int, int, Any] | None
     else:
         agent = cached
     return _agent_usage(agent) if agent is not None else None
+
+
+def reasoning_effort_for_turn(agent: Any, gateway: Any, hook_reasoning_config: Any = None) -> str:
+    for reasoning_config in (
+        hook_reasoning_config,
+        getattr(agent, "reasoning_config", None),
+        getattr(gateway, "_reasoning_config", None),
+    ):
+        effort = display_reasoning_effort(reasoning_config)
+        if effort:
+            return effort
+    return ""
 
 
 def _adapter_for_platform(gateway: Any, platform_key: Any, platform: str) -> Any:
@@ -319,7 +352,13 @@ def pre_gateway_dispatch(event: Any, gateway: Any, session_store: Any, **kwargs:
     return None
 
 
-def post_llm_call(session_id: str, model: str = "", platform: str = "", **_: Any) -> None:
+def post_llm_call(
+    session_id: str,
+    model: str = "",
+    platform: str = "",
+    reasoning_config: Any = None,
+    **_: Any,
+) -> None:
     meta = _SESSION_CONTEXT_BY_ID.get(session_id)
     if not meta:
         return None
@@ -332,7 +371,8 @@ def post_llm_call(session_id: str, model: str = "", platform: str = "", **_: Any
     usage = extract_usage(gateway, session_key)
     if usage is None:
         return None
-    used, limit, _agent = usage
+    used, limit, agent = usage
+    effort = reasoning_effort_for_turn(agent, gateway, reasoning_config)
 
     cache = load_cache(CACHE_PATH)
     sessions = cache.setdefault("sessions", {})
@@ -344,10 +384,11 @@ def post_llm_call(session_id: str, model: str = "", platform: str = "", **_: Any
             "chat_id": chat_id,
             "thread_id": meta.get("thread_id"),
             "model": model,
+            "reasoning_effort": effort,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
     )
-    notice = evaluate_notification(record, used=used, limit=limit, model=model)
+    notice = evaluate_notification(record, used=used, limit=limit, model=model, effort=effort)
     write_cache(CACHE_PATH, cache)
     if notice is None:
         return None

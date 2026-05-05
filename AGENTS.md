@@ -58,7 +58,7 @@ Manual gateway validation requires a Hermes gateway restart after enabling or ch
 ## Runtime behavior
 
 - `pre_gateway_dispatch` captures supported platform event metadata, gateway, adapter, session key, session id, chat id, thread id, original metadata, and the gateway event loop.
-- `post_llm_call` reads context usage from the live or cached agent: `agent.context_compressor.last_prompt_tokens / context_length`, and appends the hook-provided model name when available.
+- `post_llm_call` reads context usage from the live or cached agent: `agent.context_compressor.last_prompt_tokens / context_length`, and appends the hook-provided model name when available. It appends reasoning effort from the hook, active agent, or gateway config when available.
 - If usage cannot be read, skip the turn. Do not estimate from cumulative token counters.
 - Notifications start at 50% and fire once per 5% bucket per `session_key`.
 - If usage jumps across multiple buckets, send only the current bucket notification.
@@ -93,7 +93,7 @@ plugins:
 
 ## Workflow notes
 
-- Keep messaging notifications short, for example `:warning: Context: 85% (230K/270K), gpt-5.5`; for million-token windows use `1M`, not `1000K`.
+- Keep messaging notifications short, for example `:warning: Context: 85% (230K/270K), gpt-5.5 (medium)`; for million-token windows use `1M`, not `1000K`.
 - The notification target is the current gateway conversation. Preserve platform thread/topic metadata via `notice_send_metadata()`.
 - Do not store message bodies, secrets, or raw platform payloads in `cache.json`.
 - Restart the gateway before expecting Slack or other gateway surfaces to use new plugin code.
