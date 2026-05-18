@@ -33,6 +33,14 @@ _DELIVERY_SEQUENCE = 0
 MAX_LEDGER_ENTRIES_PER_SESSION = 20
 MAX_LEDGER_SESSIONS = 100
 MIN_SUFFIX_CANDIDATE_CHARS = 80
+LAST_ID_INTERNAL_SPLIT_PLATFORMS = {
+    "slack",
+    "mattermost",
+    "matrix",
+    "whatsapp",
+    "feishu",
+}
+UNSAFE_SPLIT_METHODS = {"send_split_unsafe", "edit_continuation_unsafe"}
 
 _CONTEXT_NOTICE_RE = re.compile(
     r"(?m)^(?::(?:straight_ruler|warning|rotating_light):|[📏⚠️🚨])\s+Context:\s+\d+%\s+\([^)]*\)(?:,\s*.*)?$"
@@ -63,6 +71,56 @@ def record_delivery_entry(session_key: str, entry: dict[str, Any]) -> None:
 
 def normalize_delivery_text(text: Any) -> str:
     return "\n".join(str(text or "").strip().split())
+
+
+def platform_returns_last_split_message_id(platform: str) -> bool:
+    return str(platform or "").lower() in LAST_ID_INTERNAL_SPLIT_PLATFORMS
+
+
+def _adapter_message_len_fn(adapter: Any) -> Callable[[str], int] | None:
+    len_fn = getattr(adapter, "message_len_fn", None)
+    if callable(len_fn):
+        return len_fn
+    platform_name = str(getattr(adapter, "name", "") or "").lower()
+    if "telegram" in platform_name:
+        try:
+            from gateway.platforms.telegram import utf16_len
+
+            return utf16_len
+        except Exception:
+            return None
+    return None
+
+
+def split_chunks_for_adapter(adapter: Any, content: str, *, format_for_delivery: bool = True) -> list[str]:
+    text = str(content or "")
+    if not text:
+        return []
+    truncate = getattr(adapter, "truncate_message", None)
+    limit = int(getattr(adapter, "MAX_MESSAGE_LENGTH", 0) or 0)
+    if not callable(truncate) or limit <= 0:
+        return [text]
+    if format_for_delivery:
+        format_message = getattr(adapter, "format_message", None)
+        if callable(format_message):
+            try:
+                text = str(format_message(text) or "")
+            except Exception:
+                return [str(content or "")]
+    kwargs = {}
+    len_fn = _adapter_message_len_fn(adapter)
+    if callable(len_fn):
+        kwargs["len_fn"] = len_fn
+    try:
+        chunks = truncate(text, limit, **kwargs)
+    except TypeError:
+        try:
+            chunks = truncate(text, max_length=limit, **kwargs)
+        except TypeError:
+            chunks = truncate(text, limit)
+    except Exception:
+        return [text]
+    return [str(chunk) for chunk in chunks if str(chunk or "")]
 
 
 def is_context_notice_text(text: Any) -> bool:
@@ -96,6 +154,8 @@ def _content_is_response_suffix(content: str, assistant_response: str) -> bool:
 
 def _safe_edit_entry(entry: dict[str, Any]) -> str | None:
     content = str(entry.get("content") or "")
+    if entry.get("method") in UNSAFE_SPLIT_METHODS:
+        return None
     if not entry.get("message_id") or not entry.get("chat_id") or not content:
         return None
     if is_context_notice_text(content) or is_obvious_status_text(content):
@@ -116,7 +176,8 @@ def select_edit_candidate(
         content = _safe_edit_entry(entry)
         if content is None or entry.get("split_parent"):
             continue
-        if _content_matches_response(content, assistant_response) or _content_is_response_suffix(content, assistant_response):
+        match_content = str(entry.get("match_content") or content)
+        if _content_matches_response(match_content, assistant_response) or _content_is_response_suffix(match_content, assistant_response):
             return entry
         return None
     return None
@@ -189,15 +250,34 @@ def _record_delivery_from_send(adapter: Any, chat_id: Any, content: Any, args: t
     message_id = _result_message_id(result)
     if not message_id:
         return
+    platform = str(meta.get("platform") or "").lower()
+    entry_content = str(content or "")
+    # `content` is what we will edit back into the platform message. It may be
+    # adapter-formatted. `match_content` stays raw so suffix matching compares
+    # against the raw assistant_response from the LLM.
+    match_content = entry_content
+    method = "send"
+    delivery_chunks = split_chunks_for_adapter(adapter, entry_content)
+    if len(delivery_chunks) > 1:
+        raw_chunks = split_chunks_for_adapter(adapter, entry_content, format_for_delivery=False)
+        if platform_returns_last_split_message_id(platform) and len(raw_chunks) == len(delivery_chunks):
+            entry_content = delivery_chunks[-1]
+            match_content = raw_chunks[-1]
+            method = "send_split_tail"
+        else:
+            method = "send_split_unsafe"
     base_entry = {
         "session_key": meta["session_key"],
         "platform": meta.get("platform"),
         "chat_id": str(chat_id),
         "thread_id": _metadata_thread_id(metadata) or meta.get("thread_id"),
         "message_id": message_id,
-        "content": str(content or ""),
+        "content": entry_content,
+        "match_content": match_content,
         "metadata": metadata,
-        "method": "send",
+        "method": method,
+        "split_chunks": len(delivery_chunks) if len(delivery_chunks) > 1 else None,
+        "split_original_length": len(str(content or "")) if len(delivery_chunks) > 1 else None,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     record_delivery_entry(meta["session_key"], base_entry)
@@ -232,6 +312,22 @@ def _record_delivery_from_edit(
     resolved_message_id = _result_message_id(result, fallback=message_id)
     if not resolved_message_id:
         return
+    entry_content = str(content or "")
+    # Keep delivered content and raw matching content separate for overflow
+    # continuations as well: edits must preserve platform formatting, while
+    # candidate selection compares to the raw assistant_response.
+    match_content = entry_content
+    method = "edit"
+    continuation_ids = tuple(getattr(result, "continuation_message_ids", ()) or ())
+    if continuation_ids:
+        delivery_chunks = split_chunks_for_adapter(adapter, entry_content)
+        raw_chunks = split_chunks_for_adapter(adapter, entry_content, format_for_delivery=False)
+        if len(delivery_chunks) > 1 and len(raw_chunks) == len(delivery_chunks):
+            entry_content = delivery_chunks[-1]
+            match_content = raw_chunks[-1]
+            method = "edit_continuation_tail"
+        else:
+            method = "edit_continuation_unsafe"
     record_delivery_entry(
         meta["session_key"],
         {
@@ -240,9 +336,11 @@ def _record_delivery_from_edit(
             "chat_id": str(chat_id),
             "thread_id": _metadata_thread_id(metadata) or meta.get("thread_id"),
             "message_id": resolved_message_id,
-            "content": str(content or ""),
+            "content": entry_content,
+            "match_content": match_content,
             "metadata": metadata,
-            "method": "edit",
+            "method": method,
+            "continuation_message_ids": continuation_ids,
             "created_at": datetime.now(timezone.utc).isoformat(),
         },
     )

@@ -15,6 +15,8 @@ def clear_plugin_globals():
         hcn._DELIVERY_LEDGER_BY_SESSION.clear()
     if hasattr(hcn, "_ADAPTER_OBSERVERS"):
         hcn._ADAPTER_OBSERVERS.clear()
+    if hasattr(hcn, "_DELIVERY_SEQUENCE"):
+        hcn._DELIVERY_SEQUENCE = 0
 
 
 class DummyAdapter:
@@ -819,3 +821,178 @@ async def test_split_response_notice_edits_latest_recorded_final_chunk_without_s
         False,
     )
     assert adapter.sent == [("C1", first_chunk, {"thread_ts": "T1"}), ("C1", final_chunk, {"thread_ts": "T1"})]
+
+
+def test_split_chunks_for_adapter_uses_formatting_limit_and_len_fn():
+    seen = {}
+
+    class FormattingAdapter:
+        MAX_MESSAGE_LENGTH = 20
+
+        def format_message(self, content):
+            return f"fmt:{content}"
+
+        def message_len_fn(self, text):
+            return len(text)
+
+        def truncate_message(self, content, max_length, **kwargs):
+            seen["content"] = content
+            seen["max_length"] = max_length
+            seen["len_fn"] = kwargs.get("len_fn")
+            return [content[:max_length], content[max_length:]]
+
+    adapter = FormattingAdapter()
+
+    chunks = hcn.split_chunks_for_adapter(adapter, "x" * 30)
+
+    assert seen == {"content": "fmt:" + "x" * 30, "max_length": 20, "len_fn": adapter.message_len_fn}
+    assert chunks == ["fmt:" + "x" * 16, "x" * 14]
+
+
+def test_platform_returns_last_split_message_id_scope():
+    assert hcn.platform_returns_last_split_message_id("slack") is True
+    assert hcn.platform_returns_last_split_message_id("mattermost") is True
+    assert hcn.platform_returns_last_split_message_id("matrix") is True
+    assert hcn.platform_returns_last_split_message_id("whatsapp") is True
+    assert hcn.platform_returns_last_split_message_id("feishu") is True
+    assert hcn.platform_returns_last_split_message_id("discord") is False
+    assert hcn.platform_returns_last_split_message_id("telegram") is False
+
+
+@pytest.mark.asyncio
+async def test_observed_send_records_last_chunk_for_last_id_internal_split():
+    class SlackSplitAdapter(DummyAdapter):
+        MAX_MESSAGE_LENGTH = 20
+        name = "slack"
+
+        def truncate_message(self, content, max_length, **_):
+            return [content[:max_length], content[max_length:]]
+
+        async def send(self, chat_id, content, metadata=None):
+            self.sent.append((chat_id, content, metadata))
+            return SimpleNamespace(success=True, message_id="last")
+
+    adapter = SlackSplitAdapter()
+    source = SimpleNamespace(platform=SimpleNamespace(value="slack"), chat_id="C1", thread_id="T1")
+    event = SimpleNamespace(source=source, message_id="msg-1", metadata={"thread_ts": "T1"})
+    entry = SimpleNamespace(session_key="key", session_id="sid")
+    session_store = SimpleNamespace(get_or_create_session=lambda src: entry)
+    gateway = SimpleNamespace(adapters={"slack": adapter})
+    hcn.capture_gateway_context(event=event, gateway=gateway, session_store=session_store)
+
+    await adapter.send("C1", "a" * 30, metadata={"thread_ts": "T1"})
+
+    recorded = hcn._DELIVERY_LEDGER_BY_SESSION["key"][-1]
+    assert recorded["message_id"] == "last"
+    assert recorded["content"] == "a" * 10
+    assert recorded["method"] == "send_split_tail"
+    assert recorded["split_chunks"] == 2
+
+
+@pytest.mark.asyncio
+async def test_discord_like_internal_split_falls_back_instead_of_editing_first_chunk(tmp_path, monkeypatch):
+    monkeypatch.setattr(hcn, "CACHE_PATH", tmp_path / "cache.json")
+
+    class DiscordSplitAdapter(DummyAdapter):
+        MAX_MESSAGE_LENGTH = 20
+        name = "discord"
+
+        def truncate_message(self, content, max_length, **_):
+            return [content[:max_length], content[max_length:]]
+
+        async def send(self, chat_id, content, metadata=None):
+            self.sent.append((chat_id, content, metadata))
+            return SimpleNamespace(success=True, message_id="first")
+
+    adapter = DiscordSplitAdapter()
+    source = SimpleNamespace(platform=SimpleNamespace(value="discord"), chat_id="C1", thread_id="T1")
+    event = SimpleNamespace(source=source, message_id="msg-1", metadata={"thread_id": "T1"})
+    entry = SimpleNamespace(session_key="session", session_id="sid")
+    session_store = SimpleNamespace(get_or_create_session=lambda src: entry)
+    compressor = SimpleNamespace(last_prompt_tokens=158_000, context_length=272_000)
+    agent = SimpleNamespace(context_compressor=compressor, reasoning_config={"enabled": True, "effort": "medium"})
+    gateway = SimpleNamespace(_running_agents={"session": agent}, _agent_cache={}, adapters={"discord": adapter})
+    full_response = "a" * 30
+
+    hcn.capture_gateway_context(event=event, gateway=gateway, session_store=session_store)
+    await adapter.send("C1", full_response, metadata={"thread_id": "T1"})
+    hcn.post_llm_call(session_id="sid", model="gpt-5.5", platform="discord", assistant_response=full_response)
+    adapter._post_delivery_callbacks["session"]()
+    await asyncio.sleep(0.01)
+
+    assert adapter.edits == []
+    assert adapter.sent[-1][1] == ":straight_ruler: Context: 55% (158K/272K), gpt-5.5 medium"
+
+
+@pytest.mark.asyncio
+async def test_observed_edit_records_telegram_overflow_final_continuation():
+    class TelegramOverflowAdapter(DummyAdapter):
+        MAX_MESSAGE_LENGTH = 80
+        name = "telegram"
+
+        def truncate_message(self, content, max_length, **_):
+            return [content[:max_length], content[max_length:]]
+
+        async def edit_message(self, chat_id, message_id, content, metadata=None):
+            self.edits.append((chat_id, message_id, content, metadata))
+            return SimpleNamespace(
+                success=True,
+                message_id="tail",
+                continuation_message_ids=("mid", "tail"),
+            )
+
+    adapter = TelegramOverflowAdapter()
+    source = SimpleNamespace(platform=SimpleNamespace(value="telegram"), chat_id="123", thread_id="42")
+    event = SimpleNamespace(source=source, message_id="msg-1", metadata={"message_thread_id": "42"})
+    entry = SimpleNamespace(session_key="key", session_id="sid")
+    session_store = SimpleNamespace(get_or_create_session=lambda src: entry)
+    gateway = SimpleNamespace(adapters={"telegram": adapter})
+    content = "first chunk ".ljust(80, "x") + "final chunk with enough detail to be selected safely " * 2
+    hcn.capture_gateway_context(event=event, gateway=gateway, session_store=session_store)
+
+    await adapter.edit_message("123", "orig", content, metadata={"message_thread_id": "42"})
+
+    recorded = hcn._DELIVERY_LEDGER_BY_SESSION["key"][-1]
+    assert recorded["message_id"] == "tail"
+    assert recorded["method"] == "edit_continuation_tail"
+    assert recorded["content"].startswith("final chunk")
+
+
+@pytest.mark.asyncio
+async def test_slack_internal_split_notice_edits_last_chunk_not_full_response(tmp_path, monkeypatch):
+    monkeypatch.setattr(hcn, "CACHE_PATH", tmp_path / "cache.json")
+
+    class SlackSplitAdapter(SlackLikeAdapter):
+        MAX_MESSAGE_LENGTH = 20
+        name = "slack"
+
+        def truncate_message(self, content, max_length, **_):
+            return [content[:max_length], content[max_length:]]
+
+        async def send(self, chat_id, content, metadata=None):
+            self.sent.append((chat_id, content, metadata))
+            return SimpleNamespace(success=True, message_id="last")
+
+    adapter = SlackSplitAdapter()
+    source = SimpleNamespace(platform=SimpleNamespace(value="slack"), chat_id="C1", thread_id="T1")
+    event = SimpleNamespace(source=source, message_id="msg-1", metadata={"thread_ts": "T1"})
+    entry = SimpleNamespace(session_key="session", session_id="sid")
+    session_store = SimpleNamespace(get_or_create_session=lambda src: entry)
+    compressor = SimpleNamespace(last_prompt_tokens=158_000, context_length=272_000)
+    agent = SimpleNamespace(context_compressor=compressor, reasoning_config={"enabled": True, "effort": "medium"})
+    gateway = SimpleNamespace(_running_agents={"session": agent}, _agent_cache={}, adapters={"slack": adapter})
+    full_response = "a" * 20 + "b" * 90
+
+    hcn.capture_gateway_context(event=event, gateway=gateway, session_store=session_store)
+    await adapter.send("C1", full_response, metadata={"thread_ts": "T1"})
+    hcn.post_llm_call(session_id="sid", model="gpt-5.5", platform="slack", assistant_response=full_response)
+    adapter._post_delivery_callbacks["session"]()
+    await asyncio.sleep(0.01)
+
+    assert adapter.edits[-1] == (
+        "C1",
+        "last",
+        ("b" * 90) + "\n\n:straight_ruler: Context: 55% (158K/272K), gpt-5.5 medium",
+        False,
+    )
+    assert len(adapter.sent) == 1
