@@ -39,6 +39,12 @@ class DummyAdapter:
             self._post_delivery_callbacks[session_key] = (generation, callback)
 
 
+class SlackLikeAdapter(DummyAdapter):
+    async def edit_message(self, chat_id, message_id, content, *, finalize=False):
+        self.edits.append((chat_id, message_id, content, finalize))
+        return SimpleNamespace(success=True, message_id=message_id)
+
+
 def test_supported_platform_allowlist_matches_planned_scope():
     assert hcn.DEFAULT_SUPPORTED_PLATFORMS == {
         "slack",
@@ -308,7 +314,7 @@ async def test_observed_send_and_edit_return_original_results_and_record_matchin
     hcn.capture_gateway_context(event=event, gateway=gateway, session_store=session_store)
 
     send_result = await adapter.send("C1", "Final answer", metadata={"thread_ts": "T1"})
-    edit_result = await adapter.edit_message("C1", send_result.message_id, "Final answer edited", metadata={"thread_ts": "T1"})
+    edit_result = await adapter.edit_message("C1", send_result.message_id, "Final answer edited")
 
     assert send_result.message_id == "m1"
     assert edit_result.message_id == "m1"
@@ -316,6 +322,7 @@ async def test_observed_send_and_edit_return_original_results_and_record_matchin
         ("send", "m1", "Final answer"),
         ("edit", "m1", "Final answer edited"),
     ]
+    assert hcn._DELIVERY_LEDGER_BY_SESSION["key"][-1]["metadata"] == {"thread_ts": "T1"}
 
 
 @pytest.mark.asyncio
@@ -512,7 +519,7 @@ def test_register_post_delivery_notice_preserves_existing_generation_tuple():
 
 
 def test_register_post_delivery_notice_edits_matching_candidate_without_side_message():
-    adapter = DummyAdapter()
+    adapter = SlackLikeAdapter()
     loop = asyncio.new_event_loop()
     hcn.record_delivery_entry(
         "session",
@@ -534,7 +541,7 @@ def test_register_post_delivery_notice_edits_matching_candidate_without_side_mes
     finally:
         loop.close()
 
-    assert adapter.edits == [("C1", "m1", "Final answer\n\n:warning: Context: 85% (230K/270K)", {"thread_id": "T1", "foo": "bar"})]
+    assert adapter.edits == [("C1", "m1", "Final answer\n\n:warning: Context: 85% (230K/270K)", False)]
     assert adapter.sent == []
 
 
@@ -660,7 +667,7 @@ async def test_streaming_like_flow_edits_last_finalized_message(tmp_path, monkey
 
     hcn.capture_gateway_context(event=event, gateway=gateway, session_store=session_store)
     send_result = await adapter.send("C1", "Partial answer", metadata={"thread_ts": "T1"})
-    await adapter.edit_message("C1", send_result.message_id, "Final answer", metadata={"thread_ts": "T1"})
+    await adapter.edit_message("C1", send_result.message_id, "Final answer")
 
     hcn.post_llm_call(session_id="sid", model="gpt-5.5", platform="slack", assistant_response="Final answer")
     adapter._post_delivery_callbacks["session"]()

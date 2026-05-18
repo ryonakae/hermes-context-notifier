@@ -139,6 +139,18 @@ def _matching_session_meta(adapter: Any, chat_id: Any, metadata: dict[str, Any])
     return max(matches, key=lambda item: int(item.get("captured_at", 0) or 0))
 
 
+def _ledger_entry_for_message(chat_id: Any, message_id: Any) -> tuple[str, dict[str, Any]] | None:
+    chat = str(chat_id or "")
+    msg = str(message_id or "")
+    if not chat or not msg:
+        return None
+    for session_key, entries in reversed(list(_DELIVERY_LEDGER_BY_SESSION.items())):
+        for entry in reversed(entries):
+            if str(entry.get("chat_id") or "") == chat and str(entry.get("message_id") or "") == msg:
+                return session_key, entry
+    return None
+
+
 def _record_delivery_from_send(adapter: Any, chat_id: Any, content: Any, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any) -> None:
     if not _result_success(result) or is_obvious_status_text(content) or is_context_notice_text(content):
         return
@@ -178,8 +190,19 @@ def _record_delivery_from_edit(
         return
     metadata = _metadata_from_call(args, kwargs)
     meta = _matching_session_meta(adapter, chat_id, metadata)
+    previous_entry: dict[str, Any] | None = None
     if meta is None:
-        return
+        previous = _ledger_entry_for_message(chat_id, message_id)
+        if previous is None:
+            return
+        previous_session_key, previous_entry = previous
+        meta = {
+            "session_key": previous_session_key,
+            "platform": previous_entry.get("platform"),
+            "thread_id": previous_entry.get("thread_id"),
+        }
+        if not metadata:
+            metadata = dict(previous_entry.get("metadata") or {})
     resolved_message_id = _result_message_id(result, fallback=message_id)
     if not resolved_message_id:
         return
@@ -545,6 +568,15 @@ def adapter_may_edit(adapter: Any) -> bool:
     return callable(getattr(adapter, "edit_message", None))
 
 
+async def _call_edit_message(adapter: Any, chat_id: Any, message_id: Any, content: str, metadata: dict[str, Any] | None) -> Any:
+    try:
+        return await adapter.edit_message(chat_id, message_id, content, metadata=metadata)
+    except TypeError as exc:
+        if "metadata" not in str(exc):
+            raise
+        return await adapter.edit_message(chat_id, message_id, content)
+
+
 def _edit_or_send_later(
     adapter: Any,
     chat_id: str,
@@ -568,11 +600,12 @@ def _edit_or_send_later(
 
     async def _edit_or_fallback() -> None:
         try:
-            result = await adapter.edit_message(
+            result = await _call_edit_message(
+                adapter,
                 candidate["chat_id"],
                 candidate["message_id"],
                 updated_content,
-                metadata=edit_metadata,
+                edit_metadata,
             )
         except Exception:
             try:
