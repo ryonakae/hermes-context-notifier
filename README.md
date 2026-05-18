@@ -1,6 +1,6 @@
 # Hermes Context Notifier
 
-`hermes-context-notifier` is a [Hermes Agent](https://hermes-agent.nousresearch.com/) plugin for messaging platforms. It watches a gateway conversation's context window and posts a short note when usage crosses a threshold.
+`hermes-context-notifier` is a [Hermes Agent](https://hermes-agent.nousresearch.com/) plugin for messaging platforms. It watches a gateway conversation's context window and adds a short notice when usage crosses a threshold.
 
 It is built for non-CLI conversations where the usual terminal context display is not visible. It supports Slack, Telegram, Discord, Mattermost, Matrix, WhatsApp, Signal, Feishu, DingTalk, and BlueBubbles/iMessage gateway conversations.
 
@@ -8,12 +8,15 @@ It is built for non-CLI conversations where the usual terminal context display i
 ⚠️ Context: 85% (230K/270K), gpt-5.5 medium
 ```
 
-It does not patch Hermes core. The plugin listens to gateway hooks, reads context usage from the active agent, and sends the note after the main platform reply has gone out.
+It does not patch Hermes core. The plugin listens to gateway hooks, reads context usage from the active agent, observes future adapter deliveries in an in-memory ledger, and tries to append the notice to the final editable Hermes message. If editing is unsupported, unsafe, or fails, it falls back to sending the same short side-message after the main platform reply.
 
 ## What it does
 
 - Supports selected messaging gateway conversations. CLI is intentionally out of scope.
-- Uses a platform-neutral capture/send path, with an allowlist for platforms where a short side-message fits the UX.
+- Uses a platform-neutral capture/send path, with an allowlist for platforms where a short context notice fits the UX.
+- Observes adapter `send()` / `edit_message()` calls in memory and tries to edit the last safe assistant message instead of posting a separate notification.
+- Falls back to a side-message when the platform cannot edit, the final message cannot be identified safely, or edit fails.
+- Does not call platform history APIs and does not patch Hermes core.
 - Reads usage from `agent.context_compressor.last_prompt_tokens / context_length`.
 - Adds the active model name when Hermes exposes it to the hook. Provider/path prefixes are shortened to the last component.
 - Adds the reasoning effort after the model name when it is available from the active agent, for example `gpt-5.5 medium`.
@@ -24,6 +27,7 @@ It does not patch Hermes core. The plugin listens to gateway hooks, reads contex
 - If usage jumps from, say, 49% to 72%, it sends the 70% note only.
 - If compression drops usage, it lowers the stored bucket so later growth can notify again.
 - Chains `register_post_delivery_callback` so existing post-delivery work runs first.
+- Keeps delivery bodies only in process memory for best-effort editing. `cache.json` stores dedupe state only and never stores message bodies or raw platform payloads.
 
 Supported by default:
 
@@ -115,6 +119,8 @@ PY
 ## Runtime state
 
 The plugin writes dedupe state to `cache.json` next to the plugin. Git ignores the file. It stores session metadata and bucket state, not message bodies or raw platform payloads.
+
+The delivery ledger used for message editing is process-local memory only. A gateway restart clears it, which is safe because it only observes future deliveries and falls back to side-messages when no editable delivery is known.
 
 ## License
 

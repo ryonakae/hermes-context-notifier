@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -25,6 +26,214 @@ DEFAULT_SUPPORTED_PLATFORMS = {
 }
 
 _SESSION_CONTEXT_BY_ID: dict[str, dict[str, Any]] = {}
+_DELIVERY_LEDGER_BY_SESSION: dict[str, list[dict[str, Any]]] = {}
+_ADAPTER_OBSERVERS: dict[int, dict[str, Any]] = {}
+_CAPTURE_SEQUENCE = 0
+MAX_LEDGER_ENTRIES_PER_SESSION = 20
+MAX_LEDGER_SESSIONS = 100
+
+_CONTEXT_NOTICE_RE = re.compile(
+    r"(?m)^(?::(?:straight_ruler|warning|rotating_light):|[📏⚠️🚨])\s+Context:\s+\d+%\s+\([^)]*\)(?:,\s*.*)?$"
+)
+_STATUS_PREFIXES = (
+    "⏳ Still working",
+    "⚠️ No activity",
+    "Dangerous command requires approval",
+)
+
+
+def record_delivery_entry(session_key: str, entry: dict[str, Any]) -> None:
+    if not session_key:
+        return
+    entries = _DELIVERY_LEDGER_BY_SESSION.setdefault(session_key, [])
+    entries.append(dict(entry))
+    overflow = len(entries) - MAX_LEDGER_ENTRIES_PER_SESSION
+    if overflow > 0:
+        del entries[:overflow]
+    session_overflow = len(_DELIVERY_LEDGER_BY_SESSION) - MAX_LEDGER_SESSIONS
+    for old_session_key in list(_DELIVERY_LEDGER_BY_SESSION)[: max(0, session_overflow)]:
+        if old_session_key != session_key:
+            _DELIVERY_LEDGER_BY_SESSION.pop(old_session_key, None)
+
+
+def normalize_delivery_text(text: Any) -> str:
+    return "\n".join(str(text or "").strip().split())
+
+
+def is_context_notice_text(text: Any) -> bool:
+    return bool(_CONTEXT_NOTICE_RE.search(str(text or "")))
+
+
+def is_obvious_status_text(text: Any) -> bool:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return True
+    if is_context_notice_text(stripped) and normalize_delivery_text(stripped).startswith(":"):
+        return True
+    return any(stripped.startswith(prefix) for prefix in _STATUS_PREFIXES)
+
+
+def _content_matches_response(content: str, assistant_response: str) -> bool:
+    normalized_content = normalize_delivery_text(content)
+    normalized_response = normalize_delivery_text(assistant_response)
+    if not normalized_content or not normalized_response:
+        return False
+    return normalized_content == normalized_response
+
+
+def select_edit_candidate(session_key: str, assistant_response: str, notice_text: str) -> dict[str, Any] | None:
+    del notice_text
+    for entry in reversed(_DELIVERY_LEDGER_BY_SESSION.get(session_key, [])):
+        content = str(entry.get("content") or "")
+        if not entry.get("message_id") or not entry.get("chat_id") or not content:
+            continue
+        if is_context_notice_text(content) or is_obvious_status_text(content):
+            continue
+        if _content_matches_response(content, assistant_response):
+            return entry
+    return None
+
+
+def _result_success(result: Any) -> bool:
+    return bool(getattr(result, "success", result is not None))
+
+
+def _result_message_id(result: Any, fallback: Any = None) -> str:
+    return str(getattr(result, "message_id", None) or getattr(result, "ts", None) or fallback or "")
+
+
+def _metadata_from_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+    metadata = kwargs.get("metadata")
+    if metadata is None and args:
+        candidate = args[-1]
+        if isinstance(candidate, dict):
+            metadata = candidate
+    return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _metadata_thread_id(metadata: dict[str, Any]) -> str | None:
+    for key in ("thread_id", "thread_ts", "message_thread_id", "root_id"):
+        value = metadata.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _matching_session_meta(adapter: Any, chat_id: Any, metadata: dict[str, Any]) -> dict[str, Any] | None:
+    chat = str(chat_id or "")
+    delivery_thread = _metadata_thread_id(metadata)
+    matches = []
+    for meta in _SESSION_CONTEXT_BY_ID.values():
+        if meta.get("adapter") is not adapter:
+            continue
+        if str(meta.get("chat_id") or "") != chat:
+            continue
+        meta_thread = str(meta.get("thread_id") or "")
+        if bool(meta_thread) != bool(delivery_thread):
+            continue
+        if meta_thread and delivery_thread and meta_thread != delivery_thread:
+            continue
+        matches.append(meta)
+    if not matches:
+        return None
+    return max(matches, key=lambda item: int(item.get("captured_at", 0) or 0))
+
+
+def _record_delivery_from_send(adapter: Any, chat_id: Any, content: Any, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any) -> None:
+    if not _result_success(result) or is_obvious_status_text(content) or is_context_notice_text(content):
+        return
+    metadata = _metadata_from_call(args, kwargs)
+    meta = _matching_session_meta(adapter, chat_id, metadata)
+    if meta is None:
+        return
+    message_id = _result_message_id(result)
+    if not message_id:
+        return
+    record_delivery_entry(
+        meta["session_key"],
+        {
+            "session_key": meta["session_key"],
+            "platform": meta.get("platform"),
+            "chat_id": str(chat_id),
+            "thread_id": _metadata_thread_id(metadata) or meta.get("thread_id"),
+            "message_id": message_id,
+            "content": str(content or ""),
+            "metadata": metadata,
+            "method": "send",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def _record_delivery_from_edit(
+    adapter: Any,
+    chat_id: Any,
+    message_id: Any,
+    content: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> None:
+    if not _result_success(result) or is_obvious_status_text(content) or is_context_notice_text(content):
+        return
+    metadata = _metadata_from_call(args, kwargs)
+    meta = _matching_session_meta(adapter, chat_id, metadata)
+    if meta is None:
+        return
+    resolved_message_id = _result_message_id(result, fallback=message_id)
+    if not resolved_message_id:
+        return
+    record_delivery_entry(
+        meta["session_key"],
+        {
+            "session_key": meta["session_key"],
+            "platform": meta.get("platform"),
+            "chat_id": str(chat_id),
+            "thread_id": _metadata_thread_id(metadata) or meta.get("thread_id"),
+            "message_id": resolved_message_id,
+            "content": str(content or ""),
+            "metadata": metadata,
+            "method": "edit",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def ensure_adapter_observer(adapter: Any) -> None:
+    if adapter is None:
+        return
+    key = id(adapter)
+    if key in _ADAPTER_OBSERVERS:
+        return
+    original_send = getattr(adapter, "send", None)
+    if not callable(original_send):
+        return
+    original_edit = getattr(adapter, "edit_message", None)
+
+    async def observed_send(chat_id: Any, content: Any, *args: Any, **kwargs: Any) -> Any:
+        result = await original_send(chat_id, content, *args, **kwargs)
+        try:
+            _record_delivery_from_send(adapter, chat_id, content, args, kwargs, result)
+        except Exception:
+            pass
+        return result
+
+    setattr(adapter, "send", observed_send)
+    observer = {"send": original_send}
+
+    if callable(original_edit):
+        async def observed_edit(chat_id: Any, message_id: Any, content: Any, *args: Any, **kwargs: Any) -> Any:
+            result = await original_edit(chat_id, message_id, content, *args, **kwargs)
+            try:
+                _record_delivery_from_edit(adapter, chat_id, message_id, content, args, kwargs, result)
+            except Exception:
+                pass
+            return result
+
+        setattr(adapter, "edit_message", observed_edit)
+        observer["edit_message"] = original_edit
+
+    _ADAPTER_OBSERVERS[key] = observer
 
 
 def _platform_value(platform: Any) -> str:
@@ -233,6 +442,7 @@ def _thread_id_for_event(event: Any, platform: str) -> str | None:
 
 
 def capture_gateway_context(event: Any, gateway: Any, session_store: Any, **_: Any) -> dict[str, Any] | None:
+    global _CAPTURE_SEQUENCE
     if not is_supported_event(event):
         return None
 
@@ -251,7 +461,9 @@ def capture_gateway_context(event: Any, gateway: Any, session_store: Any, **_: A
     platform_key = getattr(source, "platform", None)
     platform = _platform_value(platform_key)
     adapter = _adapter_for_platform(gateway, platform_key, platform)
+    ensure_adapter_observer(adapter)
     thread_id = _thread_id_for_event(event, platform)
+    _CAPTURE_SEQUENCE += 1
     meta = {
         "gateway": gateway,
         "adapter": adapter,
@@ -263,6 +475,7 @@ def capture_gateway_context(event: Any, gateway: Any, session_store: Any, **_: A
         "thread_id": thread_id,
         "metadata": _event_metadata(event),
         "loop": loop,
+        "captured_at": _CAPTURE_SEQUENCE,
     }
     _SESSION_CONTEXT_BY_ID[session_id] = meta
     return meta
@@ -295,14 +508,100 @@ def _send_later(adapter: Any, chat_id: str, text: str, meta: dict[str, Any], loo
     metadata = notice_send_metadata(meta)
 
     async def _send() -> None:
-        await adapter.send(chat_id, text, metadata=metadata)
+        try:
+            await adapter.send(chat_id, text, metadata=metadata)
+        except Exception:
+            return
 
+    _schedule_later(_send, loop)
+
+
+def _schedule_later(coro_factory: Callable[[], Any], loop: asyncio.AbstractEventLoop | None) -> None:
     if loop is None:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-    asyncio.run_coroutine_threadsafe(_send(), loop)
+    if loop.is_closed():
+        return
+    try:
+        future = asyncio.run_coroutine_threadsafe(coro_factory(), loop)
+    except RuntimeError:
+        return
+
+    def _consume_exception(done: Any) -> None:
+        try:
+            if not done.cancelled():
+                done.exception()
+        except Exception:
+            pass
+
+    future.add_done_callback(_consume_exception)
+
+
+def adapter_may_edit(adapter: Any) -> bool:
+    if getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True) is False:
+        return False
+    return callable(getattr(adapter, "edit_message", None))
+
+
+def _edit_or_send_later(
+    adapter: Any,
+    chat_id: str,
+    text: str,
+    meta: dict[str, Any],
+    loop: asyncio.AbstractEventLoop | None,
+    session_key: str,
+    assistant_response: str,
+) -> None:
+    if not assistant_response or not adapter_may_edit(adapter):
+        _send_later(adapter, chat_id, text, meta, loop)
+        return
+
+    candidate = select_edit_candidate(session_key, assistant_response, text)
+    if candidate is None:
+        _send_later(adapter, chat_id, text, meta, loop)
+        return
+
+    updated_content = str(candidate["content"]).rstrip() + "\n\n" + text
+    edit_metadata = {**(notice_send_metadata(meta) or {}), **(candidate.get("metadata") or {})} or None
+
+    async def _edit_or_fallback() -> None:
+        try:
+            result = await adapter.edit_message(
+                candidate["chat_id"],
+                candidate["message_id"],
+                updated_content,
+                metadata=edit_metadata,
+            )
+        except Exception:
+            try:
+                await adapter.send(chat_id, text, metadata=notice_send_metadata(meta))
+            except Exception:
+                pass
+            return
+        if not _result_success(result):
+            try:
+                await adapter.send(chat_id, text, metadata=notice_send_metadata(meta))
+            except Exception:
+                pass
+            return
+        record_delivery_entry(
+            session_key,
+            {
+                "session_key": session_key,
+                "platform": meta.get("platform"),
+                "chat_id": candidate["chat_id"],
+                "thread_id": candidate.get("thread_id") or meta.get("thread_id"),
+                "message_id": _result_message_id(result, fallback=candidate["message_id"]),
+                "content": updated_content,
+                "metadata": candidate.get("metadata") or {},
+                "method": "edit",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    _schedule_later(_edit_or_fallback, loop)
 
 
 def register_post_delivery_notice(
@@ -314,6 +613,7 @@ def register_post_delivery_notice(
     meta: dict[str, Any],
     loop: asyncio.AbstractEventLoop | None,
     generation: int | None = None,
+    assistant_response: str = "",
 ) -> None:
     existing_entry = getattr(adapter, "_post_delivery_callbacks", {}).get(session_key)
     existing_generation, existing_callback = _unwrap_callback(existing_entry)
@@ -322,7 +622,7 @@ def register_post_delivery_notice(
     def combined_callback() -> None:
         if callable(existing_callback):
             existing_callback()
-        _send_later(adapter, chat_id, text, meta, loop)
+        _edit_or_send_later(adapter, chat_id, text, meta, loop, session_key, assistant_response)
 
     if hasattr(adapter, "register_post_delivery_callback"):
         adapter.register_post_delivery_callback(
@@ -357,6 +657,7 @@ def post_llm_call(
     model: str = "",
     platform: str = "",
     reasoning_config: Any = None,
+    assistant_response: str = "",
     **_: Any,
 ) -> None:
     meta = _SESSION_CONTEXT_BY_ID.get(session_id)
@@ -408,6 +709,7 @@ def post_llm_call(
         meta=meta,
         loop=meta.get("loop"),
         generation=_adapter_generation(adapter, session_key),
+        assistant_response=assistant_response,
     )
     return None
 
