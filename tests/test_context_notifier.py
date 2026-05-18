@@ -226,6 +226,81 @@ def test_select_edit_candidate_rejects_short_prefix_match():
     assert candidate is None
 
 
+def test_select_edit_candidate_uses_recent_suffix_chunk_when_full_match_absent():
+    suffix = "Final paragraph with enough detail to be a safe suffix chunk. " * 2
+    full = "Intro paragraph.\n\n" + ("Middle text. " * 20) + suffix
+    hcn.record_delivery_entry("session", {"chat_id": "C1", "message_id": "tail", "content": suffix})
+
+    candidate = hcn.select_edit_candidate("session", full, ":warning: Context: 55% (158K/272K)")
+
+    assert candidate is not None
+    assert candidate["message_id"] == "tail"
+
+
+def test_select_edit_candidate_rejects_older_suffix_chunk_when_newer_safe_entry_exists():
+    suffix = "Final paragraph with enough detail to be a safe suffix chunk. " * 2
+    full = "Intro paragraph.\n\n" + ("Middle text. " * 20) + suffix
+    hcn.record_delivery_entry("session", {"chat_id": "C1", "message_id": "old", "content": suffix})
+    hcn.record_delivery_entry("session", {"chat_id": "C1", "message_id": "new", "content": "A newer unrelated assistant chunk"})
+
+    candidate = hcn.select_edit_candidate("session", full, ":warning: Context: 55% (158K/272K)")
+
+    assert candidate is None
+
+
+def test_select_edit_candidate_rejects_stale_suffix_before_delivery_start():
+    suffix = "Final paragraph with enough detail to be a safe suffix chunk. " * 2
+    full = "Intro paragraph.\n\n" + ("Middle text. " * 20) + suffix
+    hcn.record_delivery_entry("session", {"chat_id": "C1", "message_id": "old", "content": suffix})
+    delivery_start = hcn._DELIVERY_SEQUENCE
+
+    candidate = hcn.select_edit_candidate(
+        "session",
+        full,
+        ":warning: Context: 55% (158K/272K)",
+        min_delivery_sequence=delivery_start,
+    )
+
+    assert candidate is None
+
+
+def test_select_edit_candidate_allows_suffix_after_delivery_start():
+    suffix = "Final paragraph with enough detail to be a safe suffix chunk. " * 2
+    full = "Intro paragraph.\n\n" + ("Middle text. " * 20) + suffix
+    delivery_start = hcn._DELIVERY_SEQUENCE
+    hcn.record_delivery_entry("session", {"chat_id": "C1", "message_id": "tail", "content": suffix})
+
+    candidate = hcn.select_edit_candidate(
+        "session",
+        full,
+        ":warning: Context: 55% (158K/272K)",
+        min_delivery_sequence=delivery_start,
+    )
+
+    assert candidate is not None
+    assert candidate["message_id"] == "tail"
+
+
+def test_select_edit_candidate_rejects_tiny_suffix_chunk():
+    hcn.record_delivery_entry("session", {"chat_id": "C1", "message_id": "tail", "content": "OK"})
+
+    candidate = hcn.select_edit_candidate("session", "Long answer ending with OK", ":warning: Context: 55% (158K/272K)")
+
+    assert candidate is None
+
+
+def test_select_edit_candidate_skips_split_parent_exact_match_and_uses_tail():
+    suffix = "Final paragraph with enough detail to be a safe suffix chunk. " * 2
+    full = "Intro paragraph.\n\n" + ("Middle text. " * 20) + suffix
+    hcn.record_delivery_entry("session", {"chat_id": "C1", "message_id": "same", "content": full, "split_parent": True})
+    hcn.record_delivery_entry("session", {"chat_id": "C1", "message_id": "same", "content": suffix, "method": "send_tail"})
+
+    candidate = hcn.select_edit_candidate("session", full, ":warning: Context: 55% (158K/272K)")
+
+    assert candidate is not None
+    assert candidate["method"] == "send_tail"
+
+
 def test_extract_usage_prefers_running_agent_context_compressor():
     compressor = SimpleNamespace(last_prompt_tokens=230_000, context_length=270_000)
     agent = SimpleNamespace(context_compressor=compressor)
@@ -713,3 +788,34 @@ async def test_realistic_flow_falls_back_to_side_message_when_edit_fails(tmp_pat
         ":warning: Context: 85% (230K/270K), gpt-5.5 medium",
         {"thread_id": "topic-42", "message_thread_id": "topic-42"},
     )
+
+
+@pytest.mark.asyncio
+async def test_split_response_notice_edits_latest_recorded_final_chunk_without_side_message(tmp_path, monkeypatch):
+    monkeypatch.setattr(hcn, "CACHE_PATH", tmp_path / "cache.json")
+    adapter = SlackLikeAdapter()
+    source = SimpleNamespace(platform=SimpleNamespace(value="slack"), chat_id="C1", thread_id="T1")
+    event = SimpleNamespace(source=source, message_id="msg-1", metadata={"thread_ts": "T1"})
+    entry = SimpleNamespace(session_key="session", session_id="sid")
+    session_store = SimpleNamespace(get_or_create_session=lambda src: entry)
+    compressor = SimpleNamespace(last_prompt_tokens=158_000, context_length=272_000)
+    agent = SimpleNamespace(context_compressor=compressor, reasoning_config={"enabled": True, "effort": "medium"})
+    gateway = SimpleNamespace(_running_agents={"session": agent}, _agent_cache={}, adapters={"slack": adapter})
+    first_chunk = "first chunk"
+    final_chunk = "final chunk with enough detail to be edited safely " * 2
+    full_response = first_chunk + "\n\n" + final_chunk
+
+    hcn.capture_gateway_context(event=event, gateway=gateway, session_store=session_store)
+    await adapter.send("C1", first_chunk, metadata={"thread_ts": "T1"})
+    await adapter.send("C1", final_chunk, metadata={"thread_ts": "T1"})
+    hcn.post_llm_call(session_id="sid", model="gpt-5.5", platform="slack", assistant_response=full_response)
+    adapter._post_delivery_callbacks["session"]()
+    await asyncio.sleep(0.01)
+
+    assert adapter.edits[-1] == (
+        "C1",
+        "m2",
+        final_chunk.rstrip() + "\n\n:straight_ruler: Context: 55% (158K/272K), gpt-5.5 medium",
+        False,
+    )
+    assert adapter.sent == [("C1", first_chunk, {"thread_ts": "T1"}), ("C1", final_chunk, {"thread_ts": "T1"})]

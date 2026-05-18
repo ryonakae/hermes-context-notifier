@@ -29,8 +29,10 @@ _SESSION_CONTEXT_BY_ID: dict[str, dict[str, Any]] = {}
 _DELIVERY_LEDGER_BY_SESSION: dict[str, list[dict[str, Any]]] = {}
 _ADAPTER_OBSERVERS: dict[int, dict[str, Any]] = {}
 _CAPTURE_SEQUENCE = 0
+_DELIVERY_SEQUENCE = 0
 MAX_LEDGER_ENTRIES_PER_SESSION = 20
 MAX_LEDGER_SESSIONS = 100
+MIN_SUFFIX_CANDIDATE_CHARS = 80
 
 _CONTEXT_NOTICE_RE = re.compile(
     r"(?m)^(?::(?:straight_ruler|warning|rotating_light):|[📏⚠️🚨])\s+Context:\s+\d+%\s+\([^)]*\)(?:,\s*.*)?$"
@@ -43,8 +45,11 @@ _STATUS_PREFIXES = (
 
 
 def record_delivery_entry(session_key: str, entry: dict[str, Any]) -> None:
+    global _DELIVERY_SEQUENCE
     if not session_key:
         return
+    _DELIVERY_SEQUENCE += 1
+    entry["delivery_sequence"] = _DELIVERY_SEQUENCE
     entries = _DELIVERY_LEDGER_BY_SESSION.setdefault(session_key, [])
     entries.append(dict(entry))
     overflow = len(entries) - MAX_LEDGER_ENTRIES_PER_SESSION
@@ -81,16 +86,39 @@ def _content_matches_response(content: str, assistant_response: str) -> bool:
     return normalized_content == normalized_response
 
 
-def select_edit_candidate(session_key: str, assistant_response: str, notice_text: str) -> dict[str, Any] | None:
+def _content_is_response_suffix(content: str, assistant_response: str) -> bool:
+    normalized_content = normalize_delivery_text(content)
+    normalized_response = normalize_delivery_text(assistant_response)
+    if len(normalized_content) < MIN_SUFFIX_CANDIDATE_CHARS:
+        return False
+    return bool(normalized_response) and normalized_response.endswith(normalized_content)
+
+
+def _safe_edit_entry(entry: dict[str, Any]) -> str | None:
+    content = str(entry.get("content") or "")
+    if not entry.get("message_id") or not entry.get("chat_id") or not content:
+        return None
+    if is_context_notice_text(content) or is_obvious_status_text(content):
+        return None
+    return content
+
+
+def select_edit_candidate(
+    session_key: str,
+    assistant_response: str,
+    notice_text: str,
+    min_delivery_sequence: int | None = None,
+) -> dict[str, Any] | None:
     del notice_text
     for entry in reversed(_DELIVERY_LEDGER_BY_SESSION.get(session_key, [])):
-        content = str(entry.get("content") or "")
-        if not entry.get("message_id") or not entry.get("chat_id") or not content:
+        if min_delivery_sequence is not None and int(entry.get("delivery_sequence") or 0) <= min_delivery_sequence:
             continue
-        if is_context_notice_text(content) or is_obvious_status_text(content):
+        content = _safe_edit_entry(entry)
+        if content is None or entry.get("split_parent"):
             continue
-        if _content_matches_response(content, assistant_response):
+        if _content_matches_response(content, assistant_response) or _content_is_response_suffix(content, assistant_response):
             return entry
+        return None
     return None
 
 
@@ -161,20 +189,18 @@ def _record_delivery_from_send(adapter: Any, chat_id: Any, content: Any, args: t
     message_id = _result_message_id(result)
     if not message_id:
         return
-    record_delivery_entry(
-        meta["session_key"],
-        {
-            "session_key": meta["session_key"],
-            "platform": meta.get("platform"),
-            "chat_id": str(chat_id),
-            "thread_id": _metadata_thread_id(metadata) or meta.get("thread_id"),
-            "message_id": message_id,
-            "content": str(content or ""),
-            "metadata": metadata,
-            "method": "send",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        },
-    )
+    base_entry = {
+        "session_key": meta["session_key"],
+        "platform": meta.get("platform"),
+        "chat_id": str(chat_id),
+        "thread_id": _metadata_thread_id(metadata) or meta.get("thread_id"),
+        "message_id": message_id,
+        "content": str(content or ""),
+        "metadata": metadata,
+        "method": "send",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    record_delivery_entry(meta["session_key"], base_entry)
 
 
 def _record_delivery_from_edit(
@@ -499,6 +525,7 @@ def capture_gateway_context(event: Any, gateway: Any, session_store: Any, **_: A
         "metadata": _event_metadata(event),
         "loop": loop,
         "captured_at": _CAPTURE_SEQUENCE,
+        "delivery_start": _DELIVERY_SEQUENCE,
     }
     _SESSION_CONTEXT_BY_ID[session_id] = meta
     return meta
@@ -590,7 +617,12 @@ def _edit_or_send_later(
         _send_later(adapter, chat_id, text, meta, loop)
         return
 
-    candidate = select_edit_candidate(session_key, assistant_response, text)
+    candidate = select_edit_candidate(
+        session_key,
+        assistant_response,
+        text,
+        min_delivery_sequence=meta.get("delivery_start"),
+    )
     if candidate is None:
         _send_later(adapter, chat_id, text, meta, loop)
         return
