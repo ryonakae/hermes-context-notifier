@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +51,26 @@ _STATUS_PREFIXES = (
     "⚠️ No activity",
     "Dangerous command requires approval",
 )
+
+logger = logging.getLogger("gateway.plugins.hermes_context_notifier")
+
+
+def _safe_log_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return re.sub(r"\s+", "_", str(value))
+
+
+def _format_log_fields(**fields: Any) -> str:
+    return " ".join(f"{key}={_safe_log_value(value)}" for key, value in fields.items() if value is not None)
+
+
+def _log_info(event: str, **fields: Any) -> None:
+    logger.info("context_notifier %s", _format_log_fields(event=event, **fields))
+
+
+def _log_warning(event: str, **fields: Any) -> None:
+    logger.warning("context_notifier %s", _format_log_fields(event=event, **fields))
 
 
 def record_delivery_entry(session_key: str, entry: dict[str, Any]) -> None:
@@ -105,7 +126,13 @@ def split_chunks_for_adapter(adapter: Any, content: str, *, format_for_delivery:
         if callable(format_message):
             try:
                 text = str(format_message(text) or "")
-            except Exception:
+            except Exception as exc:
+                _log_warning(
+                    "split_reconstruct_failed",
+                    phase="format",
+                    adapter=getattr(adapter, "name", type(adapter).__name__),
+                    exception=type(exc).__name__,
+                )
                 return [str(content or "")]
     kwargs = {}
     len_fn = _adapter_message_len_fn(adapter)
@@ -118,7 +145,13 @@ def split_chunks_for_adapter(adapter: Any, content: str, *, format_for_delivery:
             chunks = truncate(text, max_length=limit, **kwargs)
         except TypeError:
             chunks = truncate(text, limit)
-    except Exception:
+    except Exception as exc:
+        _log_warning(
+            "split_reconstruct_failed",
+            phase="truncate",
+            adapter=getattr(adapter, "name", type(adapter).__name__),
+            exception=type(exc).__name__,
+        )
         return [text]
     return [str(chunk) for chunk in chunks if str(chunk or "")]
 
@@ -281,6 +314,14 @@ def _record_delivery_from_send(adapter: Any, chat_id: Any, content: Any, args: t
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     record_delivery_entry(meta["session_key"], base_entry)
+    _log_info(
+        "delivery_record",
+        session_key=meta["session_key"],
+        platform=meta.get("platform"),
+        method=method,
+        has_message_id=bool(message_id),
+        split_chunks=base_entry.get("split_chunks"),
+    )
 
 
 def _record_delivery_from_edit(
@@ -344,6 +385,14 @@ def _record_delivery_from_edit(
             "created_at": datetime.now(timezone.utc).isoformat(),
         },
     )
+    _log_info(
+        "delivery_record",
+        session_key=meta["session_key"],
+        platform=meta.get("platform"),
+        method=method,
+        has_message_id=bool(resolved_message_id),
+        continuation_count=len(continuation_ids),
+    )
 
 
 def ensure_adapter_observer(adapter: Any) -> None:
@@ -361,8 +410,8 @@ def ensure_adapter_observer(adapter: Any) -> None:
         result = await original_send(chat_id, content, *args, **kwargs)
         try:
             _record_delivery_from_send(adapter, chat_id, content, args, kwargs, result)
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_warning("observer_record_failed", operation="send", exception=type(exc).__name__)
         return result
 
     setattr(adapter, "send", observed_send)
@@ -373,8 +422,8 @@ def ensure_adapter_observer(adapter: Any) -> None:
             result = await original_edit(chat_id, message_id, content, *args, **kwargs)
             try:
                 _record_delivery_from_edit(adapter, chat_id, message_id, content, args, kwargs, result)
-            except Exception:
-                pass
+            except Exception as exc:
+                _log_warning("observer_record_failed", operation="edit", exception=type(exc).__name__)
             return result
 
         setattr(adapter, "edit_message", observed_edit)
@@ -658,7 +707,9 @@ def _send_later(adapter: Any, chat_id: str, text: str, meta: dict[str, Any], loo
     async def _send() -> None:
         try:
             await adapter.send(chat_id, text, metadata=metadata)
-        except Exception:
+            _log_info("side_send", session_key=meta.get("session_key"), platform=meta.get("platform"), success=True)
+        except Exception as exc:
+            _log_warning("side_send", session_key=meta.get("session_key"), platform=meta.get("platform"), success=False, exception=type(exc).__name__)
             return
 
     _schedule_later(_send, loop)
@@ -668,13 +719,16 @@ def _schedule_later(coro_factory: Callable[[], Any], loop: asyncio.AbstractEvent
     if loop is None:
         try:
             loop = asyncio.get_running_loop()
-        except RuntimeError:
+        except RuntimeError as exc:
+            _log_warning("schedule_failed", reason="no_running_loop", exception=type(exc).__name__)
             return
     if loop.is_closed():
+        _log_warning("schedule_failed", reason="loop_closed")
         return
     try:
         future = asyncio.run_coroutine_threadsafe(coro_factory(), loop)
-    except RuntimeError:
+    except RuntimeError as exc:
+        _log_warning("schedule_failed", reason="run_coroutine_threadsafe", exception=type(exc).__name__)
         return
 
     def _consume_exception(done: Any) -> None:
@@ -711,7 +765,12 @@ def _edit_or_send_later(
     session_key: str,
     assistant_response: str,
 ) -> None:
-    if not assistant_response or not adapter_may_edit(adapter):
+    if not assistant_response:
+        _log_info("edit_candidate", session_key=session_key, platform=meta.get("platform"), result="skip", reason="missing_assistant_response")
+        _send_later(adapter, chat_id, text, meta, loop)
+        return
+    if not adapter_may_edit(adapter):
+        _log_info("edit_candidate", session_key=session_key, platform=meta.get("platform"), result="skip", reason="adapter_not_editable")
         _send_later(adapter, chat_id, text, meta, loop)
         return
 
@@ -722,9 +781,17 @@ def _edit_or_send_later(
         min_delivery_sequence=meta.get("delivery_start"),
     )
     if candidate is None:
+        _log_info("edit_candidate", session_key=session_key, platform=meta.get("platform"), result="none")
         _send_later(adapter, chat_id, text, meta, loop)
         return
 
+    _log_info(
+        "edit_candidate",
+        session_key=session_key,
+        platform=meta.get("platform"),
+        result="found",
+        method=candidate.get("method"),
+    )
     updated_content = str(candidate["content"]).rstrip() + "\n\n" + text
     edit_metadata = {**(notice_send_metadata(meta) or {}), **(candidate.get("metadata") or {})} or None
 
@@ -737,18 +804,23 @@ def _edit_or_send_later(
                 updated_content,
                 edit_metadata,
             )
-        except Exception:
+        except Exception as exc:
+            _log_warning("edit_result", session_key=session_key, platform=meta.get("platform"), success=False, reason="edit_exception", exception=type(exc).__name__)
             try:
                 await adapter.send(chat_id, text, metadata=notice_send_metadata(meta))
-            except Exception:
-                pass
+                _log_info("fallback_send", session_key=session_key, platform=meta.get("platform"), reason="edit_exception", success=True)
+            except Exception as send_exc:
+                _log_warning("fallback_send", session_key=session_key, platform=meta.get("platform"), reason="edit_exception", success=False, exception=type(send_exc).__name__)
             return
         if not _result_success(result):
+            _log_info("edit_result", session_key=session_key, platform=meta.get("platform"), success=False, reason="edit_result_failed")
             try:
                 await adapter.send(chat_id, text, metadata=notice_send_metadata(meta))
-            except Exception:
-                pass
+                _log_info("fallback_send", session_key=session_key, platform=meta.get("platform"), reason="edit_result_failed", success=True)
+            except Exception as send_exc:
+                _log_warning("fallback_send", session_key=session_key, platform=meta.get("platform"), reason="edit_result_failed", success=False, exception=type(send_exc).__name__)
             return
+        _log_info("edit_result", session_key=session_key, platform=meta.get("platform"), success=True)
         record_delivery_entry(
             session_key,
             {
@@ -825,15 +897,24 @@ def post_llm_call(
 ) -> None:
     meta = _SESSION_CONTEXT_BY_ID.get(session_id)
     if not meta:
+        _log_info("post_llm_skip", session_id=session_id, reason="missing_session_context")
         return None
     gateway = meta.get("gateway")
     session_key = meta.get("session_key")
     chat_id = meta.get("chat_id")
     if not gateway or not session_key or not chat_id:
+        _log_info(
+            "post_llm_skip",
+            session_id=session_id,
+            session_key=session_key,
+            platform=meta.get("platform") or platform,
+            reason="missing_required_meta",
+        )
         return None
 
     usage = extract_usage(gateway, session_key)
     if usage is None:
+        _log_info("usage_decision", session_key=session_key, platform=meta.get("platform") or platform, notice="no", reason="usage_unavailable")
         return None
     used, limit, agent = usage
     effort = reasoning_effort_for_turn(agent, gateway, reasoning_config)
@@ -855,15 +936,47 @@ def post_llm_call(
     notice = evaluate_notification(record, used=used, limit=limit, model=model, effort=effort)
     write_cache(CACHE_PATH, cache)
     if notice is None:
+        bucket = record.get("bucket")
+        last = record.get("last_notified_bucket")
+        if bucket is not None and int(bucket or 0) < 50:
+            reason = "below_threshold"
+        elif bucket is not None and last is not None and int(bucket or 0) <= int(last or 0):
+            reason = "bucket_not_advanced"
+        else:
+            reason = "no_notice"
+        _log_info(
+            "usage_decision",
+            session_key=session_key,
+            session_id=session_id,
+            platform=record.get("platform"),
+            percent=record.get("percent"),
+            bucket=bucket,
+            last_notified_bucket=last,
+            notice="no",
+            reason=reason,
+        )
         return None
+
+    _log_info(
+        "usage_decision",
+        session_key=session_key,
+        session_id=session_id,
+        platform=record.get("platform"),
+        percent=notice.get("percent"),
+        bucket=notice.get("bucket"),
+        last_notified_bucket=record.get("last_notified_bucket"),
+        notice="yes",
+    )
 
     adapter = meta.get("adapter")
     if adapter is None:
         # Fallback for adapter maps keyed differently from event.source.platform.
         adapter = _adapter_for_platform(gateway, None, meta.get("platform") or platform or "")
     if adapter is None:
+        _log_info("notice_register", session_key=session_key, session_id=session_id, platform=record.get("platform"), result="skip", reason="adapter_missing")
         return None
 
+    _log_info("notice_register", session_key=session_key, session_id=session_id, platform=record.get("platform"), result="registered")
     register_post_delivery_notice(
         adapter=adapter,
         session_key=session_key,

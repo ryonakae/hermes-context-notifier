@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -542,6 +543,43 @@ def test_post_llm_call_records_non_slack_platform_and_registers_notice(tmp_path,
     assert record["reasoning_effort"] == "medium"
     assert "session" in adapter._post_delivery_callbacks
 
+
+def test_post_llm_call_logs_usage_decision_without_message_body(tmp_path, monkeypatch, caplog):
+    cache_path = tmp_path / "cache.json"
+    monkeypatch.setattr(hcn, "CACHE_PATH", cache_path)
+    adapter = DummyAdapter()
+    compressor = SimpleNamespace(last_prompt_tokens=99_244, context_length=272_000)
+    agent = SimpleNamespace(context_compressor=compressor, reasoning_config={"enabled": True, "effort": "medium"})
+    gateway = SimpleNamespace(_running_agents={"session": agent}, _agent_cache={}, adapters={"slack": adapter})
+    assistant_response = "Sensitive final answer that must not appear in logs"
+    hcn._SESSION_CONTEXT_BY_ID["sid"] = {
+        "gateway": gateway,
+        "adapter": adapter,
+        "session_key": "session",
+        "session_id": "sid",
+        "platform": "slack",
+        "chat_id": "C1",
+        "thread_id": "T1",
+        "metadata": {"thread_ts": "T1"},
+        "loop": None,
+    }
+
+    with caplog.at_level(logging.INFO, logger="gateway.plugins.hermes_context_notifier"):
+        hcn.post_llm_call(
+            session_id="sid",
+            model="gpt-5.5",
+            platform="slack",
+            assistant_response=assistant_response,
+        )
+
+    messages = [record.getMessage() for record in caplog.records if record.name == "gateway.plugins.hermes_context_notifier"]
+    assert any(
+        "event=usage_decision" in message and "notice=no" in message and "reason=below_threshold" in message
+        for message in messages
+    )
+    assert all(assistant_response not in message for message in messages)
+
+
 def test_register_post_delivery_notice_chains_existing_callback_and_sends_after_it():
     adapter = DummyAdapter()
     order = []
@@ -622,6 +660,35 @@ def test_register_post_delivery_notice_edits_matching_candidate_without_side_mes
     assert adapter.sent == []
 
 
+def test_register_post_delivery_notice_logs_edit_candidate_and_result(caplog):
+    adapter = SlackLikeAdapter()
+    loop = asyncio.new_event_loop()
+    hcn.record_delivery_entry(
+        "session",
+        {"chat_id": "C1", "message_id": "m1", "content": "Final answer", "metadata": {"foo": "bar"}},
+    )
+    try:
+        with caplog.at_level(logging.INFO, logger="gateway.plugins.hermes_context_notifier"):
+            hcn.register_post_delivery_notice(
+                adapter=adapter,
+                session_key="session",
+                chat_id="C1",
+                meta={"platform": "slack", "thread_id": "T1", "metadata": {}},
+                text=":warning: Context: 85% (230K/270K)",
+                loop=loop,
+                generation=None,
+                assistant_response="Final answer",
+            )
+            adapter._post_delivery_callbacks["session"]()
+            loop.run_until_complete(asyncio.sleep(0))
+    finally:
+        loop.close()
+
+    messages = [record.getMessage() for record in caplog.records if record.name == "gateway.plugins.hermes_context_notifier"]
+    assert any("event=edit_candidate" in message and "result=found" in message for message in messages)
+    assert any("event=edit_result" in message and "success=true" in message for message in messages)
+
+
 def test_register_post_delivery_notice_falls_back_when_edit_fails():
     class FailingEditAdapter(DummyAdapter):
         async def edit_message(self, chat_id, message_id, content, metadata=None):
@@ -649,6 +716,36 @@ def test_register_post_delivery_notice_falls_back_when_edit_fails():
 
     assert adapter.edits
     assert adapter.sent == [("C1", ":warning: Context: 85% (230K/270K)", {"thread_id": "T1"})]
+
+
+def test_register_post_delivery_notice_fallback_logs_reason(caplog):
+    class FailingEditAdapter(DummyAdapter):
+        async def edit_message(self, chat_id, message_id, content, metadata=None):
+            self.edits.append((chat_id, message_id, content, metadata))
+            return SimpleNamespace(success=False, message_id=message_id)
+
+    adapter = FailingEditAdapter()
+    loop = asyncio.new_event_loop()
+    hcn.record_delivery_entry("session", {"chat_id": "C1", "message_id": "m1", "content": "Final answer"})
+    try:
+        with caplog.at_level(logging.INFO, logger="gateway.plugins.hermes_context_notifier"):
+            hcn.register_post_delivery_notice(
+                adapter=adapter,
+                session_key="session",
+                chat_id="C1",
+                meta={"platform": "slack", "thread_id": "T1", "metadata": {}},
+                text=":warning: Context: 85% (230K/270K)",
+                loop=loop,
+                generation=None,
+                assistant_response="Final answer",
+            )
+            adapter._post_delivery_callbacks["session"]()
+            loop.run_until_complete(asyncio.sleep(0))
+    finally:
+        loop.close()
+
+    messages = [record.getMessage() for record in caplog.records if record.name == "gateway.plugins.hermes_context_notifier"]
+    assert any("event=fallback_send" in message and "reason=edit_result_failed" in message for message in messages)
 
 
 def test_register_post_delivery_notice_falls_back_when_adapter_is_not_editable():
