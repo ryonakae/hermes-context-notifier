@@ -69,8 +69,29 @@ def _log_info(event: str, **fields: Any) -> None:
     logger.info("context_notifier %s", _format_log_fields(event=event, **fields))
 
 
+def _log_debug(event: str, **fields: Any) -> None:
+    logger.debug("context_notifier %s", _format_log_fields(event=event, **fields))
+
+
 def _log_warning(event: str, **fields: Any) -> None:
     logger.warning("context_notifier %s", _format_log_fields(event=event, **fields))
+
+
+def _length_bucket(text: Any) -> str:
+    length = len(str(text or ""))
+    if length <= 0:
+        return "0"
+    if length <= 100:
+        return "1-100"
+    if length <= 500:
+        return "101-500"
+    if length <= 1000:
+        return "501-1000"
+    if length <= 2000:
+        return "1001-2000"
+    if length <= 4000:
+        return "2001-4000"
+    return "4000+"
 
 
 def record_delivery_entry(session_key: str, entry: dict[str, Any]) -> None:
@@ -185,6 +206,18 @@ def _content_is_response_suffix(content: str, assistant_response: str) -> bool:
     return bool(normalized_response) and normalized_response.endswith(normalized_content)
 
 
+def _candidate_match_kind(content: str, assistant_response: str) -> str:
+    if _content_matches_response(content, assistant_response):
+        return "exact"
+    if _content_is_response_suffix(content, assistant_response):
+        return "suffix"
+    return "none"
+
+
+def _is_split_tail_method(method: Any) -> bool:
+    return str(method or "") in {"send_split_tail", "edit_continuation_tail"}
+
+
 def _safe_edit_entry(entry: dict[str, Any]) -> str | None:
     content = str(entry.get("content") or "")
     if entry.get("method") in UNSAFE_SPLIT_METHODS:
@@ -291,7 +324,8 @@ def _record_delivery_from_send(adapter: Any, chat_id: Any, content: Any, args: t
     match_content = entry_content
     method = "send"
     delivery_chunks = split_chunks_for_adapter(adapter, entry_content)
-    if len(delivery_chunks) > 1:
+    split_considered = len(delivery_chunks) > 1
+    if split_considered:
         raw_chunks = split_chunks_for_adapter(adapter, entry_content, format_for_delivery=False)
         if platform_returns_last_split_message_id(platform) and len(raw_chunks) == len(delivery_chunks):
             entry_content = delivery_chunks[-1]
@@ -320,7 +354,10 @@ def _record_delivery_from_send(adapter: Any, chat_id: Any, content: Any, args: t
         platform=meta.get("platform"),
         method=method,
         has_message_id=bool(message_id),
+        split_considered=split_considered,
         split_chunks=base_entry.get("split_chunks"),
+        content_length_bucket=_length_bucket(entry_content),
+        formatted_length_bucket=_length_bucket("".join(delivery_chunks)),
     )
 
 
@@ -360,9 +397,12 @@ def _record_delivery_from_edit(
     match_content = entry_content
     method = "edit"
     continuation_ids = tuple(getattr(result, "continuation_message_ids", ()) or ())
+    split_considered = bool(continuation_ids)
+    split_chunks = None
     if continuation_ids:
         delivery_chunks = split_chunks_for_adapter(adapter, entry_content)
         raw_chunks = split_chunks_for_adapter(adapter, entry_content, format_for_delivery=False)
+        split_chunks = len(delivery_chunks) if len(delivery_chunks) > 1 else None
         if len(delivery_chunks) > 1 and len(raw_chunks) == len(delivery_chunks):
             entry_content = delivery_chunks[-1]
             match_content = raw_chunks[-1]
@@ -382,6 +422,7 @@ def _record_delivery_from_edit(
             "metadata": metadata,
             "method": method,
             "continuation_message_ids": continuation_ids,
+            "split_chunks": split_chunks,
             "created_at": datetime.now(timezone.utc).isoformat(),
         },
     )
@@ -392,6 +433,9 @@ def _record_delivery_from_edit(
         method=method,
         has_message_id=bool(resolved_message_id),
         continuation_count=len(continuation_ids),
+        split_considered=split_considered,
+        split_chunks=split_chunks,
+        content_length_bucket=_length_bucket(entry_content),
     )
 
 
@@ -675,6 +719,13 @@ def capture_gateway_context(event: Any, gateway: Any, session_store: Any, **_: A
         "delivery_start": _DELIVERY_SEQUENCE,
     }
     _SESSION_CONTEXT_BY_ID[session_id] = meta
+    _log_info(
+        "context_capture",
+        session_id=session_id,
+        session_key=session_key,
+        platform=platform,
+        has_adapter=adapter is not None,
+    )
     return meta
 
 
@@ -781,16 +832,26 @@ def _edit_or_send_later(
         min_delivery_sequence=meta.get("delivery_start"),
     )
     if candidate is None:
-        _log_info("edit_candidate", session_key=session_key, platform=meta.get("platform"), result="none")
+        _log_info("edit_candidate", session_key=session_key, platform=meta.get("platform"), result="none", candidate_match="none")
         _send_later(adapter, chat_id, text, meta, loop)
         return
 
+    match_content = str(candidate.get("match_content") or candidate.get("content") or "")
+    candidate_match = _candidate_match_kind(match_content, assistant_response)
     _log_info(
         "edit_candidate",
         session_key=session_key,
         platform=meta.get("platform"),
         result="found",
         method=candidate.get("method"),
+        candidate_method=candidate.get("method"),
+        candidate_match=candidate_match,
+        candidate_split_chunks=candidate.get("split_chunks"),
+        candidate_split_parent=bool(candidate.get("split_parent")),
+        candidate_delivery_sequence=candidate.get("delivery_sequence"),
+        candidate_created_after_delivery_start=(
+            int(candidate.get("delivery_sequence") or 0) > int(meta.get("delivery_start") or 0)
+        ),
     )
     updated_content = str(candidate["content"]).rstrip() + "\n\n" + text
     edit_metadata = {**(notice_send_metadata(meta) or {}), **(candidate.get("metadata") or {})} or None
@@ -805,7 +866,17 @@ def _edit_or_send_later(
                 edit_metadata,
             )
         except Exception as exc:
-            _log_warning("edit_result", session_key=session_key, platform=meta.get("platform"), success=False, reason="edit_exception", exception=type(exc).__name__)
+            _log_warning(
+                "edit_result",
+                session_key=session_key,
+                platform=meta.get("platform"),
+                success=False,
+                reason="edit_exception",
+                exception=type(exc).__name__,
+                target_method=candidate.get("method"),
+                target_split_chunks=candidate.get("split_chunks"),
+                target_is_split_tail=_is_split_tail_method(candidate.get("method")),
+            )
             try:
                 await adapter.send(chat_id, text, metadata=notice_send_metadata(meta))
                 _log_info("fallback_send", session_key=session_key, platform=meta.get("platform"), reason="edit_exception", success=True)
@@ -813,14 +884,31 @@ def _edit_or_send_later(
                 _log_warning("fallback_send", session_key=session_key, platform=meta.get("platform"), reason="edit_exception", success=False, exception=type(send_exc).__name__)
             return
         if not _result_success(result):
-            _log_info("edit_result", session_key=session_key, platform=meta.get("platform"), success=False, reason="edit_result_failed")
+            _log_info(
+                "edit_result",
+                session_key=session_key,
+                platform=meta.get("platform"),
+                success=False,
+                reason="edit_result_failed",
+                target_method=candidate.get("method"),
+                target_split_chunks=candidate.get("split_chunks"),
+                target_is_split_tail=_is_split_tail_method(candidate.get("method")),
+            )
             try:
                 await adapter.send(chat_id, text, metadata=notice_send_metadata(meta))
                 _log_info("fallback_send", session_key=session_key, platform=meta.get("platform"), reason="edit_result_failed", success=True)
             except Exception as send_exc:
                 _log_warning("fallback_send", session_key=session_key, platform=meta.get("platform"), reason="edit_result_failed", success=False, exception=type(send_exc).__name__)
             return
-        _log_info("edit_result", session_key=session_key, platform=meta.get("platform"), success=True)
+        _log_info(
+            "edit_result",
+            session_key=session_key,
+            platform=meta.get("platform"),
+            success=True,
+            target_method=candidate.get("method"),
+            target_split_chunks=candidate.get("split_chunks"),
+            target_is_split_tail=_is_split_tail_method(candidate.get("method")),
+        )
         record_delivery_entry(
             session_key,
             {
@@ -897,7 +985,7 @@ def post_llm_call(
 ) -> None:
     meta = _SESSION_CONTEXT_BY_ID.get(session_id)
     if not meta:
-        _log_info("post_llm_skip", session_id=session_id, reason="missing_session_context")
+        _log_debug("post_llm_skip", session_id=session_id, platform=platform, reason="uncaptured_session")
         return None
     gateway = meta.get("gateway")
     session_key = meta.get("session_key")

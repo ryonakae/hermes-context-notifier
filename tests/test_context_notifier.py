@@ -1093,3 +1093,122 @@ async def test_slack_internal_split_notice_edits_last_chunk_not_full_response(tm
         False,
     )
     assert len(adapter.sent) == 1
+
+
+
+def test_post_llm_without_gateway_context_is_debug_expected_skip(caplog):
+    with caplog.at_level(logging.DEBUG, logger="gateway.plugins.hermes_context_notifier"):
+        hcn.post_llm_call(
+            session_id="child-session",
+            model="gpt-5.4-mini",
+            platform="slack",
+            assistant_response="child output",
+        )
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "gateway.plugins.hermes_context_notifier"
+    ]
+    assert not any("reason=missing_session_context" in message for message in messages)
+    assert any("event=post_llm_skip" in message and "reason=uncaptured_session" in message for message in messages)
+
+
+def test_capture_gateway_context_logs_session_correlation(caplog):
+    adapter = DummyAdapter()
+    source = SimpleNamespace(platform=SimpleNamespace(value="slack"), chat_id="C1", thread_id="T1")
+    event = SimpleNamespace(source=source, message_id="msg-1", metadata={"thread_ts": "T1"})
+    entry = SimpleNamespace(session_key="session", session_id="sid")
+    session_store = SimpleNamespace(get_or_create_session=lambda src: entry)
+    gateway = SimpleNamespace(adapters={"slack": adapter})
+
+    with caplog.at_level(logging.INFO, logger="gateway.plugins.hermes_context_notifier"):
+        hcn.capture_gateway_context(event=event, gateway=gateway, session_store=session_store)
+
+    assert any(
+        record.name == "gateway.plugins.hermes_context_notifier"
+        and "event=context_capture" in record.getMessage()
+        and "session_id=sid" in record.getMessage()
+        and "session_key=session" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_split_tail_notice_logs_body_free_target_diagnostics(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(hcn, "CACHE_PATH", tmp_path / "cache.json")
+
+    class SlackSplitAdapter(SlackLikeAdapter):
+        MAX_MESSAGE_LENGTH = 20
+        name = "slack"
+
+        def truncate_message(self, content, max_length, **_):
+            return [content[:max_length], content[max_length:]]
+
+        async def send(self, chat_id, content, metadata=None):
+            self.sent.append((chat_id, content, metadata))
+            return SimpleNamespace(success=True, message_id="last")
+
+    adapter = SlackSplitAdapter()
+    source = SimpleNamespace(platform=SimpleNamespace(value="slack"), chat_id="C1", thread_id="T1")
+    event = SimpleNamespace(source=source, message_id="msg-1", metadata={"thread_ts": "T1"})
+    entry = SimpleNamespace(session_key="session", session_id="sid")
+    session_store = SimpleNamespace(get_or_create_session=lambda src: entry)
+    compressor = SimpleNamespace(last_prompt_tokens=158_000, context_length=272_000)
+    agent = SimpleNamespace(context_compressor=compressor, reasoning_config={"enabled": True, "effort": "medium"})
+    gateway = SimpleNamespace(_running_agents={"session": agent}, _agent_cache={}, adapters={"slack": adapter})
+    full_response = "alpha-body-should-not-log" + "b" * 90
+
+    with caplog.at_level(logging.INFO, logger="gateway.plugins.hermes_context_notifier"):
+        hcn.capture_gateway_context(event=event, gateway=gateway, session_store=session_store)
+        await adapter.send("C1", full_response, metadata={"thread_ts": "T1"})
+        hcn.post_llm_call(session_id="sid", model="gpt-5.5", platform="slack", assistant_response=full_response)
+        adapter._post_delivery_callbacks["session"]()
+        await asyncio.sleep(0.01)
+
+    messages = [record.getMessage() for record in caplog.records if record.name == "gateway.plugins.hermes_context_notifier"]
+    joined = "\n".join(messages)
+    assert "method=send_split_tail" in joined
+    assert "split_considered=true" in joined
+    assert "candidate_method=send_split_tail" in joined
+    assert "candidate_match=suffix" in joined
+    assert "target_is_split_tail=true" in joined
+    assert "alpha-body-should-not-log" not in joined
+    assert "thread_ts" not in joined
+    assert "split_original_length=" not in joined
+
+
+@pytest.mark.asyncio
+async def test_notifier_edit_failure_logs_target_and_falls_back(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(hcn, "CACHE_PATH", tmp_path / "cache.json")
+
+    class FailingEditAdapter(SlackLikeAdapter):
+        async def edit_message(self, chat_id, message_id, content, *, finalize=False):
+            self.edits.append((chat_id, message_id, content, finalize))
+            return SimpleNamespace(success=False, message_id=message_id, error="msg_too_long")
+
+    adapter = FailingEditAdapter()
+    source = SimpleNamespace(platform=SimpleNamespace(value="slack"), chat_id="C1", thread_id="T1")
+    event = SimpleNamespace(source=source, message_id="msg-1", metadata={"thread_ts": "T1"})
+    entry = SimpleNamespace(session_key="session", session_id="sid")
+    session_store = SimpleNamespace(get_or_create_session=lambda src: entry)
+    compressor = SimpleNamespace(last_prompt_tokens=158_000, context_length=272_000)
+    agent = SimpleNamespace(context_compressor=compressor, reasoning_config={"enabled": True, "effort": "medium"})
+    gateway = SimpleNamespace(_running_agents={"session": agent}, _agent_cache={}, adapters={"slack": adapter})
+
+    with caplog.at_level(logging.INFO, logger="gateway.plugins.hermes_context_notifier"):
+        hcn.capture_gateway_context(event=event, gateway=gateway, session_store=session_store)
+        await adapter.send("C1", "Final answer", metadata={"thread_ts": "T1"})
+        hcn.post_llm_call(session_id="sid", model="gpt-5.5", platform="slack", assistant_response="Final answer")
+        adapter._post_delivery_callbacks["session"]()
+        await asyncio.sleep(0.01)
+
+    messages = [record.getMessage() for record in caplog.records if record.name == "gateway.plugins.hermes_context_notifier"]
+    joined = "\n".join(messages)
+    assert adapter.edits
+    assert adapter.sent[-1][1] == ":straight_ruler: Context: 55% (158K/272K), gpt-5.5 medium"
+    assert "event=edit_result" in joined
+    assert "success=false" in joined
+    assert "target_method=send" in joined
+    assert "event=fallback_send" in joined
+    assert "success=true" in joined
