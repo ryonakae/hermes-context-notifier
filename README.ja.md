@@ -1,6 +1,6 @@
 # Hermes Context Notifier
 
-Hermes Agent の messaging gateway 会話に、コンテキストウィンドウの残り具合が分かる短い通知を追加するプラグインです。
+Hermes Agent のメッセージングゲートウェイ会話に、コンテキストウィンドウの残り具合を知らせる短い通知を追加するプラグインです。
 
 <!-- README-I18N:START -->
 
@@ -14,21 +14,21 @@ Hermes Agent の messaging gateway 会話に、コンテキストウィンドウ
 - [要件](#要件)
 - [インストール](#インストール)
 - [使い方](#使い方)
-- [対応 platform](#対応-platform)
+- [対応プラットフォーム](#対応プラットフォーム)
 - [仕組み](#仕組み)
 - [開発](#開発)
 - [リポジトリ構成](#リポジトリ構成)
-- [Runtime state](#runtime-state)
-- [License](#license)
+- [実行時の状態](#実行時の状態)
+- [ライセンス](#ライセンス)
 
 ## 機能
 
-- **Gateway 向け通知:** Hermes CLI のコンテキスト表示が見えない Slack、Telegram、Discord、Mattermost、Matrix、WhatsApp、Signal、Feishu、DingTalk、BlueBubbles/iMessage で動きます。
-- **安全ならインライン追記:** adapter delivery をメモリ上で追跡し、最後の編集可能な assistant メッセージへ通知を追記します。
+- **ゲートウェイ向け通知:** Hermes CLI のコンテキスト表示が見えない Slack、Telegram、Discord、Mattermost、Matrix、WhatsApp、Signal、Feishu、DingTalk、BlueBubbles/iMessage で動きます。
+- **安全な場合はインライン追記:** アダプターの配信結果をメモリ上で追跡し、最後の編集可能なアシスタントメッセージへ通知を追記します。
 - **別メッセージへのフォールバック:** 編集できない場合や安全に対象を特定できない場合は、メイン返信の後に同じ短い通知を送ります。
 - **正確な使用量だけを使用:** `agent.context_compressor.last_prompt_tokens / context_length` を読み、正確な値が取れないターンは通知しません。
-- **Bucket 単位の重複抑制:** 50% から 5% ごとに、`session_key` ごと 1 回だけ通知します。圧縮で使用量が下がると再通知できる状態に戻します。
-- **永続データを最小化:** `cache.json` には重複抑制の状態だけを保存し、メッセージ本文や platform payload は保存しません。
+- **バケット単位の重複抑制:** 50% から 5% ごとに、`session_key` ごと 1 回だけ通知します。圧縮で使用量が下がると、後でまた通知できる状態に戻します。
+- **永続データを最小化:** `cache.json` には重複抑制の状態だけを保存します。メッセージ本文やプラットフォームの生データは保存しません。
 
 ```text
 :warning: Context: 85% (230K/270K), gpt-5.5 medium
@@ -36,13 +36,13 @@ Hermes Agent の messaging gateway 会話に、コンテキストウィンドウ
 
 ## 要件
 
-- standalone plugin loading が有効な Hermes Agent。
+- スタンドアロンプラグインの読み込みが有効な Hermes Agent。
 - Python 3.11 以上。
-- 対応 platform 上の Hermes gateway 会話。
+- 対応プラットフォーム上の Hermes ゲートウェイ会話。
 
 ## インストール
 
-プラグインを Hermes plugins ディレクトリへ clone します。
+プラグインを Hermes のプラグインディレクトリへクローンします。
 
 ```bash
 git clone https://github.com/ryonakae/hermes-context-notifier.git ~/.hermes/plugins/hermes-context-notifier
@@ -56,11 +56,11 @@ plugins:
     - hermes-context-notifier
 ```
 
-有効化後、またはプラグイン変更後は Hermes gateway を再起動してください。Hermes は gateway process の起動時に plugin code を import します。
+有効化後、またはプラグイン変更後は Hermes ゲートウェイを再起動してください。Hermes はゲートウェイプロセスの起動時にプラグインコードをインポートします。
 
 ## 使い方
 
-このプラグインは Hermes hooks 経由で動きます。CLI command は追加しません。対応 gateway surface で会話していると、コンテキスト使用量が bucket を超えたタイミングで、assistant のメイン返信後に通知を追加します。
+このプラグインは Hermes のフック経由で動きます。CLI コマンドは追加しません。対応ゲートウェイで会話していると、コンテキスト使用量がバケットを超えたタイミングで、アシスタントのメイン返信後に通知を追加します。
 
 通知例:
 
@@ -71,15 +71,15 @@ plugins:
 :warning: Context: 85% (850K/1M), gpt-5.5 medium
 ```
 
-Emoji levels:
+絵文字レベル:
 
-| Usage bucket | Emoji |
+| 使用率バケット | 絵文字 |
 | --- | --- |
 | 50-65% | `:straight_ruler:` |
 | 70-85% | `:warning:` |
 | 90%+ | `:rotating_light:` |
 
-## 対応 platform
+## 対応プラットフォーム
 
 デフォルトで有効:
 
@@ -94,26 +94,26 @@ Emoji levels:
 - DingTalk
 - BlueBubbles / iMessage
 
-Email、SMS、Webhook、API Server、Home Assistant、WeCom、Weixin、QQBot、Yuanbao は、platform ごとの検証が済むまで対象外です。
+メール、SMS、Webhook、API Server、Home Assistant、WeCom、Weixin、QQBot、Yuanbao は、各プラットフォームで検証が済むまで対象外です。
 
 ## 仕組み
 
-`pre_gateway_dispatch` は現在の gateway 会話メタデータを取得し、以後の adapter `send()` / `edit_message()` を見る observer を idempotent に取り付けます。`post_llm_call` は live agent または cached agent から正確な context usage を読み、次の通知 bucket を判定し、既存 callback が先に走るように post-delivery callback を chain します。
+`pre_gateway_dispatch` は現在のゲートウェイ会話のメタデータを取得し、以後のアダプター `send()` / `edit_message()` を監視するオブザーバーを重複しないように取り付けます。`post_llm_call` は実行中またはキャッシュ済みのエージェントから正確なコンテキスト使用量を読み、次の通知バケットを判定します。その後、既存のコールバックが先に走るように配信後コールバックを連結します。
 
-安全に編集できる最後の assistant delivery がある場合、プラグインはそのメッセージに context notice を追記します。編集に失敗した場合、adapter が編集非対応の場合、または最終メッセージを安全に特定できない場合は、thread/topic metadata を保持して同じ会話に別メッセージを送ります。
+安全に編集できる最後のアシスタント配信がある場合、プラグインはそのメッセージにコンテキスト通知を追記します。編集に失敗した場合、アダプターが編集に対応していない場合、または最終メッセージを安全に特定できない場合は、スレッドやトピックのメタデータを保ったまま同じ会話に別メッセージを送ります。
 
-Hermes hooks は正確な context usage や post-delivery callback composition をまだ public plugin API として公開していないため、このプラグインは一部の Hermes gateway private attributes を読みます。internals が変わった場合は Hermes core を patch せず、このプラグインを更新してください。
+Hermes のフックは、正確なコンテキスト使用量や配信後コールバックの連結を、まだ公開プラグイン API として提供していません。そのため、このプラグインは一部の Hermes ゲートウェイのプライベート属性を読みます。内部実装が変わった場合は Hermes コアをパッチせず、このプラグインを更新してください。
 
 ## 開発
 
-リポジトリルートで checks を実行します。
+リポジトリルートでチェックを実行します。
 
 ```bash
 python -m pytest -q
 python -m py_compile __init__.py hermes_context_notifier.py tests/test_context_notifier.py
 ```
 
-Hermes Agent checkout から plugin discovery を確認します。
+Hermes Agent のチェックアウトからプラグイン検出を確認します。
 
 ```bash
 cd ~/.hermes/hermes-agent
@@ -129,7 +129,7 @@ print('hooks=', sorted(getattr(loaded, 'hooks_registered', []) or []))
 PY
 ```
 
-期待する hooks:
+期待するフック:
 
 ```text
 ['post_llm_call', 'pre_gateway_dispatch']
@@ -137,16 +137,16 @@ PY
 
 ## リポジトリ構成
 
-- `plugin.yaml`: plugin manifest。
-- `__init__.py`: Hermes plugin entrypoint。
-- `hermes_context_notifier.py`: hook handlers、delivery observers、bucket logic、cache handling、notice delivery。
-- `tests/test_context_notifier.py`: formatting、usage extraction、bucket dedupe、metadata preservation、callback chaining、split messages、edit fallback behavior の regression tests。
-- `AGENTS.md`: coding agents 向け作業メモ。
+- `plugin.yaml`: プラグインマニフェスト。
+- `__init__.py`: Hermes プラグインのエントリーポイント。
+- `hermes_context_notifier.py`: フック処理、配信監視、バケット判定、キャッシュ処理、通知送信。
+- `tests/test_context_notifier.py`: 表示形式、使用量取得、バケット重複抑制、メタデータ保持、コールバック連結、分割メッセージ、編集失敗時のフォールバックを確認する回帰テスト。
+- `AGENTS.md`: コーディングエージェント向け作業メモ。
 
-## Runtime state
+## 実行時の状態
 
-`cache.json` は plugin の隣に per-session dedupe state を保存し、git では無視されます。`cache.json.tmp` は atomic write 用の一時ファイルです。edit selection に使う delivery ledger は process memory にだけ存在し、gateway restart で消えます。
+`cache.json` はプラグインの隣にセッションごとの重複抑制状態を保存し、Git では無視されます。`cache.json.tmp` はアトミック書き込み用の一時ファイルです。編集対象の選択に使う配信台帳はプロセスメモリ上にだけ存在し、ゲートウェイ再起動で消えます。
 
-## License
+## ライセンス
 
 [MIT](LICENSE)
