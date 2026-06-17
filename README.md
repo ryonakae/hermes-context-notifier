@@ -1,6 +1,6 @@
 # Hermes Context Notifier
 
-A Hermes Agent plugin that adds short context-window notices to messaging gateway conversations before the thread runs out of room.
+A standalone plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent) that adds short context-window notices to messaging gateway conversations before the thread runs out of room.
 
 <!-- README-I18N:START -->
 

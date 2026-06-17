@@ -1,6 +1,6 @@
 # Hermes Context Notifier
 
-Hermes Agent のメッセージングゲートウェイ会話に、コンテキストウィンドウの残り具合を知らせる短い通知を追加するプラグインです。
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) 向けのスタンドアロンプラグインです。メッセージングゲートウェイ会話に、コンテキストウィンドウの残り具合を知らせる短い通知を追加します。
 
 <!-- README-I18N:START -->
 
