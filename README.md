@@ -1,69 +1,44 @@
 # Hermes Context Notifier
 
-`hermes-context-notifier` is a [Hermes Agent](https://hermes-agent.nousresearch.com/) plugin for messaging platforms. It watches a gateway conversation's context window and adds a short notice when usage crosses a threshold.
+A Hermes Agent plugin that adds short context-window notices to messaging gateway conversations before the thread runs out of room.
 
-It is built for non-CLI conversations where the usual terminal context display is not visible. It supports Slack, Telegram, Discord, Mattermost, Matrix, WhatsApp, Signal, Feishu, DingTalk, and BlueBubbles/iMessage gateway conversations.
+<!-- README-I18N:START -->
 
-```text
-⚠️ Context: 85% (230K/270K), gpt-5.5 medium
-```
+**English** | [日本語](./README.ja.md)
 
-It does not patch Hermes core. The plugin listens to gateway hooks, reads context usage from the active agent, observes future adapter deliveries in an in-memory ledger, and tries to append the notice to the final editable Hermes message. If editing is unsupported, unsafe, or fails, it falls back to sending the same short side-message after the main platform reply.
+<!-- README-I18N:END -->
 
-## What it does
+## Contents
 
-- Supports selected messaging gateway conversations. CLI is intentionally out of scope.
-- Uses a platform-neutral capture/send path, with an allowlist for platforms where a short context notice fits the UX.
-- Observes adapter `send()` / `edit_message()` calls in memory and tries to edit the last safe assistant message instead of posting a separate notification.
-- Falls back to a side-message when the platform cannot edit, the final message cannot be identified safely, or edit fails.
-- Does not call platform history APIs and does not patch Hermes core.
-- Reads usage from `agent.context_compressor.last_prompt_tokens / context_length`.
-- Adds the active model name when Hermes exposes it to the hook. Provider/path prefixes are shortened to the last component.
-- Adds the reasoning effort after the model name when it is available from the active agent, for example `gpt-5.5 medium`.
-- Formats large context windows as `1M` instead of `1000K`.
-- Skips a turn when exact usage is unavailable.
-- Starts at 50% and checks every 5% bucket.
-- Sends one note per bucket for each `session_key`.
-- If usage jumps from, say, 49% to 72%, it sends the 70% note only.
-- If compression drops usage, it lowers the stored bucket so later growth can notify again.
-- Chains `register_post_delivery_callback` so existing post-delivery work runs first.
-- Keeps delivery bodies only in process memory for best-effort editing. `cache.json` stores dedupe state only and never stores message bodies or raw platform payloads.
+- [Features](#features)
+- [Requirements](#requirements)
+- [Install](#install)
+- [Usage](#usage)
+- [Supported platforms](#supported-platforms)
+- [How it works](#how-it-works)
+- [Development](#development)
+- [Repository layout](#repository-layout)
+- [Runtime state](#runtime-state)
+- [License](#license)
 
-Supported by default:
+## Features
 
-- Slack
-- Telegram
-- Discord
-- Mattermost
-- Matrix
-- WhatsApp
-- Signal
-- Feishu
-- DingTalk
-- BlueBubbles / iMessage
-
-Out of scope for this plugin for now:
-
-- Email and SMS, because context notices would create extra emails/texts.
-- Webhook, API Server, and Home Assistant, because they are integration surfaces rather than normal chat UI.
-- WeCom, WeCom Callback, Weixin, QQBot, and Yuanbao because they need platform-specific validation.
-
-Emoji ranges:
-
-| Usage bucket | Emoji |
-| --- | --- |
-| 50-65% | 📏 `:straight_ruler:` |
-| 70-85% | ⚠️ `:warning:` |
-| 90%+ | 🚨 `:rotating_light:` |
-
-Examples:
+- **Gateway-first notices:** Works where Hermes CLI context indicators are not visible: Slack, Telegram, Discord, Mattermost, Matrix, WhatsApp, Signal, Feishu, DingTalk, and BlueBubbles/iMessage.
+- **Inline when safe:** Tracks adapter deliveries in memory and tries to append the notice to the final editable assistant message.
+- **Side-message fallback:** Sends the same short notice after the main reply when edit support is missing or unsafe.
+- **Exact usage only:** Reads `agent.context_compressor.last_prompt_tokens / context_length` and skips the turn when Hermes cannot expose exact usage.
+- **Bucket dedupe:** Starts at 50%, fires once per 5% bucket per `session_key`, and re-arms after compression lowers usage.
+- **Private data restraint:** Stores only dedupe state in `cache.json`; message bodies and platform payloads stay out of persistent storage.
 
 ```text
-📏 Context: 50% (135K/270K), gpt-5.5 medium
-⚠️ Context: 85% (230K/270K), gpt-5.5 medium
-🚨 Context: 90% (243K/270K), gpt-5.5 medium
-⚠️ Context: 85% (850K/1M), gpt-5.5 medium
+:warning: Context: 85% (230K/270K), gpt-5.5 medium
 ```
+
+## Requirements
+
+- Hermes Agent with standalone plugin loading enabled.
+- Python 3.11 or newer.
+- A Hermes gateway conversation on one of the supported platforms.
 
 ## Install
 
@@ -81,18 +56,64 @@ plugins:
     - hermes-context-notifier
 ```
 
-Restart the Hermes gateway after enabling or changing the plugin.
+Restart the Hermes gateway after enabling or changing the plugin. Hermes imports plugin code when the gateway process starts.
+
+## Usage
+
+The plugin runs through Hermes hooks; it does not add a CLI command. Send messages through a supported gateway surface and the plugin adds a notice after the main assistant response when context usage crosses a bucket.
+
+Example notices:
+
+```text
+:straight_ruler: Context: 50% (135K/270K)
+:warning: Context: 85% (230K/270K), gpt-5.5 medium
+:rotating_light: Context: 90% (243K/270K), gpt-5.5 medium
+:warning: Context: 85% (850K/1M), gpt-5.5 medium
+```
+
+Emoji levels:
+
+| Usage bucket | Emoji |
+| --- | --- |
+| 50-65% | `:straight_ruler:` |
+| 70-85% | `:warning:` |
+| 90%+ | `:rotating_light:` |
+
+## Supported platforms
+
+Enabled by default:
+
+- Slack
+- Telegram
+- Discord
+- Mattermost
+- Matrix
+- WhatsApp
+- Signal
+- Feishu
+- DingTalk
+- BlueBubbles / iMessage
+
+The plugin intentionally excludes Email, SMS, Webhook, API Server, Home Assistant, WeCom, Weixin, QQBot, and Yuanbao until each surface has platform-specific validation.
+
+## How it works
+
+`pre_gateway_dispatch` captures the current gateway conversation metadata and installs idempotent observers around future adapter `send()` and `edit_message()` calls. `post_llm_call` reads exact context usage from the live or cached agent, evaluates the next notification bucket, then chains a post-delivery callback so existing callbacks run first.
+
+When a safe final assistant delivery is available, the plugin edits that message and appends the context notice. If editing fails, the adapter cannot edit, or the final message cannot be identified safely, it sends a separate notice to the same conversation with preserved thread/topic metadata.
+
+The plugin reads a few Hermes gateway private attributes because Hermes hooks do not yet expose exact context usage or post-delivery callback composition as public plugin APIs. If those internals change, update this plugin rather than patching Hermes core.
 
 ## Development
 
-Run the checks from the repository root:
+Run checks from the repository root:
 
 ```bash
 python -m pytest -q
 python -m py_compile __init__.py hermes_context_notifier.py tests/test_context_notifier.py
 ```
 
-Check plugin discovery from the Hermes Agent checkout:
+Check plugin discovery from a Hermes Agent checkout:
 
 ```bash
 cd ~/.hermes/hermes-agent
@@ -108,26 +129,24 @@ print('hooks=', sorted(getattr(loaded, 'hooks_registered', []) or []))
 PY
 ```
 
-## Files
+Expected hooks:
+
+```text
+['post_llm_call', 'pre_gateway_dispatch']
+```
+
+## Repository layout
 
 - `plugin.yaml`: plugin manifest.
-- `__init__.py`: thin plugin entrypoint.
-- `hermes_context_notifier.py`: hook handlers and notification logic.
-- `tests/test_context_notifier.py`: tests for formatting, compact token counts, model-name shortening, bucket logic, cache writes, usage extraction, platform capture, metadata preservation, and callback chaining.
-- `AGENTS.md`: notes for coding agents working in this repo.
+- `__init__.py`: Hermes plugin entrypoint.
+- `hermes_context_notifier.py`: hook handlers, delivery observers, bucket logic, cache handling, and notice delivery.
+- `tests/test_context_notifier.py`: regression tests for formatting, usage extraction, bucket dedupe, metadata preservation, callback chaining, split messages, and edit fallback behavior.
+- `AGENTS.md`: working notes for coding agents.
 
 ## Runtime state
 
-The plugin writes dedupe state to `cache.json` next to the plugin. Git ignores the file. It stores session metadata and bucket state, not message bodies or raw platform payloads.
-
-The delivery ledger used for message editing is process-local memory only. A gateway restart clears it, which is safe because it only observes future deliveries and falls back to side-messages when no editable delivery is known.
+`cache.json` stores per-session dedupe state next to the plugin and is ignored by git. `cache.json.tmp` is the atomic write temp file. The delivery ledger used for edit selection lives in process memory and clears on gateway restart.
 
 ## License
 
-MIT.
-
-## Why it uses private Hermes attributes
-
-Hermes hooks do not currently expose exact context-window usage or post-delivery callback composition as public plugin APIs. This plugin reads private gateway attributes such as `_running_agents`, `_agent_cache`, `_active_sessions`, and `_post_delivery_callbacks` to avoid modifying Hermes core.
-
-If those internals change, update this plugin rather than carrying a Hermes core patch.
+[MIT](LICENSE)

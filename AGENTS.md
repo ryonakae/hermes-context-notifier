@@ -1,15 +1,15 @@
 # AGENTS.md
 
-`hermes-context-notifier` is a standalone Hermes Agent plugin for non-CLI gateway conversations. It adds short context-usage notices for selected messaging platforms: Slack, Telegram, Discord, Mattermost, Matrix, WhatsApp, Signal, Feishu, DingTalk, and BlueBubbles/iMessage. It first tries to append the notice to the final editable Hermes message, then falls back to a side-message when edit is unavailable or unsafe.
+`hermes-context-notifier` is a standalone Hermes Agent plugin for messaging gateway conversations. It watches context-window usage on supported non-CLI platforms and adds a short notice after the assistant reply, preferably by editing the final safe assistant message.
 
 ## Start here
 
 - Runtime entrypoint: `__init__.py`
-- Plugin logic: `hermes_context_notifier.py`
+- Plugin implementation: `hermes_context_notifier.py`
 - Manifest: `plugin.yaml`
 - Tests: `tests/test_context_notifier.py`
-- Original implementation plan: `.hermes/plans/2026-04-28_163039-hermes-context-notifier-plugin.md`
-- Multi-platform implementation plan: `.hermes/plans/2026-04-29_223558-multi-platform-context-notifier.md`
+- User docs: `README.md` and `README.ja.md`
+- Design history: `.hermes/plans/`
 
 ## Common commands
 
@@ -20,7 +20,7 @@ python -m pytest -q
 python -m py_compile __init__.py hermes_context_notifier.py tests/test_context_notifier.py
 ```
 
-Check Hermes plugin discovery from the Hermes Agent source tree:
+When plugin registration, hook names, or `plugin.yaml` change, also check discovery from the Hermes Agent checkout:
 
 ```bash
 cd ~/.hermes/hermes-agent
@@ -42,62 +42,40 @@ Expected hooks:
 ['post_llm_call', 'pre_gateway_dispatch']
 ```
 
-## Validation
+Manual gateway validation requires a Hermes gateway restart after enabling or changing this plugin.
 
-Before committing code changes, run:
+## Runtime behavior to preserve
 
-```bash
-python -m pytest -q
-python -m py_compile __init__.py hermes_context_notifier.py tests/test_context_notifier.py
-```
-
-When touching plugin registration, `plugin.yaml`, or hook names, also run the plugin discovery check above.
-
-Manual gateway validation requires a Hermes gateway restart after enabling or changing this plugin. The gateway imports plugin code at process start.
-
-## Runtime behavior
-
-- `pre_gateway_dispatch` captures supported platform event metadata, gateway, adapter, session key, session id, chat id, thread id, original metadata, and the gateway event loop. It also installs idempotent adapter observers for future `send()` / `edit_message()` deliveries.
-- `post_llm_call` reads context usage from the live or cached agent: `agent.context_compressor.last_prompt_tokens / context_length`, and appends the hook-provided model name when available. It appends reasoning effort from the hook, active agent, or gateway config when available.
-- If usage cannot be read, skip the turn. Do not estimate from cumulative token counters.
+- `pre_gateway_dispatch` captures platform metadata, gateway, adapter, session key/id, chat id, thread id, original metadata, and the gateway event loop.
+- Adapter observer wrapping must stay idempotent. Preserve original `send()` / `edit_message()` return values and exceptions.
+- `post_llm_call` must use exact usage from `agent.context_compressor.last_prompt_tokens / context_length`; do not estimate from cumulative token counters.
 - Notifications start at 50% and fire once per 5% bucket per `session_key`.
-- If usage jumps across multiple buckets, send only the current bucket notification.
-- If usage drops after compression/reset, lower `last_notified_bucket` without sending a drop notification.
-- Send after the main messaging-platform reply by chaining `register_post_delivery_callback`. Existing callbacks must run first.
-- Prefer editing the final safe assistant message via the in-memory delivery ledger. If editing is unsupported, unsafe, or fails, fall back to the side-message send path.
-- Adapter observer wrapping is intentional and must remain idempotent. Preserve adapter return values and exceptions.
-- Do not add Slack/Discord/Telegram platform history lookup fallback without a fresh plan.
-- Do not make CLI emit these notifications; CLI already has its own context/status surfaces.
-- Do not enable Email, SMS, Webhook, API Server, Home Assistant, WeCom, Weixin, QQBot, or Yuanbao in this plugin without a fresh plan and platform-specific validation.
+- If usage jumps across buckets, send only the current bucket. If compression lowers usage, lower `last_notified_bucket` without sending a drop notice.
+- Chain `register_post_delivery_callback` so existing callbacks run first.
+- Prefer editing the final safe assistant message through `_DELIVERY_LEDGER_BY_SESSION`; fall back to a side-message when editing is unavailable, unsafe, or failed.
+- Preserve platform thread/topic metadata through `notice_send_metadata()`.
 
-## Important paths
+## Scope boundaries
 
-- `cache.json`: runtime dedupe state, ignored by git.
-- `cache.json.tmp`: atomic write temp file, ignored by git.
-- `~/.hermes/config.yaml`: local enablement lives here, not in this repo.
+- Keep the platform allowlist explicit in `DEFAULT_SUPPORTED_PLATFORMS`.
+- Do not add CLI notifications; CLI already has context/status surfaces.
+- Do not add platform history lookup fallback without a fresh plan.
+- Do not enable Email, SMS, Webhook, API Server, Home Assistant, WeCom, Weixin, QQBot, or Yuanbao without platform-specific validation.
+- Do not edit Hermes core for this feature. If Hermes internals change, update the plugin.
+- Do not add `/ctx` or `/context`; manual inspection belongs to Hermes `/usage`.
 
-Enablement example:
+## State and privacy
 
-```yaml
-plugins:
-  enabled:
-    - hermes-context-notifier
-```
+- `cache.json` stores runtime dedupe state and is ignored by git.
+- `cache.json.tmp` is the atomic write temp file and is ignored by git.
+- Delivery bodies may exist in `_DELIVERY_LEDGER_BY_SESSION` process memory only.
+- Do not persist message bodies, secrets, or raw platform payloads in `cache.json`, tests, docs, or logs.
 
 ## Coding guidelines
 
 - Keep the plugin dependency-free and Python 3.11 compatible.
-- Keep `__init__.py` as a thin plugin entrypoint that works under Hermes plugin loading and direct pytest import.
-- Prefer small pure functions for bucket, formatting, cache, and usage extraction logic. Cover them in `tests/test_context_notifier.py`.
-- Keep platform allowlisting explicit in `DEFAULT_SUPPORTED_PLATFORMS`; do not switch to "all Hermes platforms" by default.
-- Treat Hermes gateway private attributes as fragile: `_running_agents`, `_agent_cache`, `_active_sessions`, and `_post_delivery_callbacks` may change upstream.
-- Adapter delivery bodies may exist in `_DELIVERY_LEDGER_BY_SESSION` process memory only. Do not persist them to `cache.json` or docs/examples.
-- Do not edit Hermes core for this feature. If internals change, update this plugin.
-- Do not add `/ctx` or `/context`; manual inspection belongs to Hermes `/usage`.
-
-## Workflow notes
-
-- Keep messaging notifications short, for example `:warning: Context: 85% (230K/270K), gpt-5.5 medium`; for million-token windows use `1M`, not `1000K`.
-- The notification target is the current gateway conversation. Preserve platform thread/topic metadata via `notice_send_metadata()`.
-- Do not store message bodies, secrets, or raw platform payloads in `cache.json`.
-- Restart the gateway before expecting Slack or other gateway surfaces to use new plugin code.
+- Keep `__init__.py` as a thin entrypoint that works under Hermes plugin loading and direct pytest import.
+- Prefer small pure functions for bucket, formatting, cache, usage extraction, and candidate-selection logic.
+- Cover behavior changes in `tests/test_context_notifier.py`.
+- Keep notification text short: `:warning: Context: 85% (230K/270K), gpt-5.5 medium`.
+- Use `1M` for million-token windows, not `1000K`.
